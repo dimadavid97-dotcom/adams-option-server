@@ -25,7 +25,7 @@ const PAIRS = [
 ];
 
 const config = {
-  scanSeconds: 10,
+  scanSeconds: Number(process.env.SCAN_SECONDS || 20),
   riskPercent: Number(process.env.RISK_PERCENT || 1),
   minConfidence: Number(process.env.MIN_CONFIDENCE || 80),
   maxConsecutiveLosses: Number(
@@ -50,51 +50,94 @@ let state = {
   currentPair: null,
   currentSignal: "WAIT",
   currentConfidence: 0,
-
   currentPrice: null,
 
   openTrade: null,
 
   lastScan: null,
+  lastMessage: "Server started",
 
-  lastMessage:
-    "Server started",
-
-  dataSource:
-    "Twelve Data"
+  dataSource: "Twelve Data"
 };
 
 let history = [];
-
 let scanning = false;
-
 let scanPairIndex = 0;
 
 
 /* =====================================
-   API RATE LIMIT
+   API / CACHE
 ===================================== */
 
-const requestTimes = [];
+const cache = new Map();
 
-function canUseApi(){
+const CACHE_TTL = {
+  1: 60000,
+  5: 180000,
+  15: 300000
+};
 
-  const now = Date.now();
+let apiBlockedUntil = 0;
 
-  while(
-    requestTimes.length &&
-    now - requestTimes[0] > 60000
-  ){
-    requestTimes.shift();
-  }
-
-  return requestTimes.length < 8;
+function cacheKey(pair, timeframe){
+  return pair + "|" + timeframe;
 }
 
-function registerApiCall(){
+function getCacheTTL(timeframe){
 
-  requestTimes.push(
-    Date.now()
+  return (
+    CACHE_TTL[Number(timeframe)] ||
+    60000
+  );
+}
+
+function getCachedMarketData(
+  pair,
+  timeframe
+){
+
+  const key =
+    cacheKey(
+      pair,
+      timeframe
+    );
+
+  const item =
+    cache.get(key);
+
+  if(!item){
+    return null;
+  }
+
+  if(
+    Date.now() -
+    item.savedAt >
+    getCacheTTL(timeframe)
+  ){
+
+    cache.delete(key);
+
+    return null;
+  }
+
+  return item.data;
+}
+
+function saveMarketDataCache(
+  pair,
+  timeframe,
+  data
+){
+
+  cache.set(
+    cacheKey(
+      pair,
+      timeframe
+    ),
+    {
+      savedAt: Date.now(),
+      data
+    }
   );
 }
 
@@ -105,7 +148,8 @@ function registerApiCall(){
 
 function intervalFromMinutes(minutes){
 
-  const tf = Number(minutes);
+  const tf =
+    Number(minutes);
 
   if(tf === 5){
     return "5min";
@@ -126,7 +170,8 @@ function intervalFromMinutes(minutes){
 async function getMarketData(
   pair,
   timeframe = 1,
-  outputsize = 60
+  outputsize = 60,
+  forceRefresh = false
 ){
 
   if(!API_KEY){
@@ -136,14 +181,28 @@ async function getMarketData(
     );
   }
 
-  if(!canUseApi()){
+  if(
+    Date.now() <
+    apiBlockedUntil
+  ){
 
     throw new Error(
-      "API_RATE_LIMIT"
+      "API_COOLDOWN"
     );
   }
 
-  registerApiCall();
+  if(!forceRefresh){
+
+    const cached =
+      getCachedMarketData(
+        pair,
+        timeframe
+      );
+
+    if(cached){
+      return cached;
+    }
+  }
 
   const interval =
     intervalFromMinutes(
@@ -164,6 +223,17 @@ async function getMarketData(
   const response =
     await fetch(url);
 
+  if(response.status === 429){
+
+    apiBlockedUntil =
+      Date.now() +
+      60000;
+
+    throw new Error(
+      "API_RATE_LIMIT"
+    );
+  }
+
   if(!response.ok){
 
     throw new Error(
@@ -179,14 +249,37 @@ async function getMarketData(
     data.status === "error"
   ){
 
+    const msg =
+      String(
+        data.message || ""
+      );
+
+    if(
+      msg.toLowerCase()
+        .includes("credit") ||
+      msg.toLowerCase()
+        .includes("limit")
+    ){
+
+      apiBlockedUntil =
+        Date.now() +
+        60000;
+
+      throw new Error(
+        "API_RATE_LIMIT"
+      );
+    }
+
     throw new Error(
-      data.message ||
+      msg ||
       "Twelve Data error"
     );
   }
 
   if(
-    !Array.isArray(data.values) ||
+    !Array.isArray(
+      data.values
+    ) ||
     !data.values.length
   ){
 
@@ -195,24 +288,33 @@ async function getMarketData(
     );
   }
 
-  return data.values
-    .map(item => ({
-      datetime:
-        item.datetime,
+  const candles =
+    data.values
+      .map(item => ({
+        datetime:
+          item.datetime,
 
-      open:
-        Number(item.open),
+        open:
+          Number(item.open),
 
-      high:
-        Number(item.high),
+        high:
+          Number(item.high),
 
-      low:
-        Number(item.low),
+        low:
+          Number(item.low),
 
-      close:
-        Number(item.close)
-    }))
-    .reverse();
+        close:
+          Number(item.close)
+      }))
+      .reverse();
+
+  saveMarketDataCache(
+    pair,
+    timeframe,
+    candles
+  );
+
+  return candles;
 }
 
 
@@ -260,7 +362,6 @@ function calculateEMA(
 
   return ema;
 }
-
 
 function calculateRSI(
   values,
@@ -349,13 +450,14 @@ function calculateRSI(
 
   return (
     100 -
-    100 / (1 + rs)
+    100 /
+    (1 + rs)
   );
 }
 
 
 /* =====================================
-   REAL SIGNAL ENGINE
+   SIGNAL ENGINE
 ===================================== */
 
 async function analysePair(
@@ -417,93 +519,66 @@ async function analysePair(
       price,
       ema9,
       ema21,
-      rsi
+      rsi,
+      timeframe
     };
   }
 
   let bullishScore = 0;
   let bearishScore = 0;
 
-  /*
-    EMA TREND
-  */
-
   if(ema9 > ema21){
-
     bullishScore += 35;
-
   }
 
   if(ema9 < ema21){
-
     bearishScore += 35;
-
   }
 
-  /*
-    PRICE VS EMA
-  */
-
   if(price > ema9){
-
     bullishScore += 20;
-
   }
 
   if(price < ema9){
-
     bearishScore += 20;
-
   }
-
-  /*
-    RSI
-  */
 
   if(
     rsi >= 52 &&
     rsi <= 70
   ){
-
     bullishScore += 25;
-
   }
 
   if(
     rsi <= 48 &&
     rsi >= 30
   ){
-
     bearishScore += 25;
-
   }
-
-  /*
-    MOMENTUM
-  */
 
   if(
     price >
     previousPrice
   ){
-
     bullishScore += 20;
-
   }
 
   if(
     price <
     previousPrice
   ){
-
     bearishScore += 20;
-
   }
 
   let direction =
     "WAIT";
 
-  let confidence = 0;
+  let confidence =
+    Math.max(
+      bullishScore,
+      bearishScore
+    );
 
   if(
     bullishScore >= 65 &&
@@ -529,18 +604,6 @@ async function analysePair(
 
     confidence =
       bearishScore;
-
-  }
-  else{
-
-    direction =
-      "WAIT";
-
-    confidence =
-      Math.max(
-        bullishScore,
-        bearishScore
-      );
   }
 
   confidence =
@@ -575,7 +638,6 @@ async function analysePair(
 
     bullishScore,
     bearishScore,
-
     timeframe
   };
 }
@@ -639,27 +701,31 @@ app.post(
       state.lastMessage =
         `${result.pair} ${result.direction} ${result.confidence}%`;
 
-      console.log(
-        "REAL MARKET:",
-        state.lastMessage
-      );
-
       res.json({
         ok:true,
-        source:
-          "Twelve Data",
+        source:"Twelve Data",
+        cached:
+          Boolean(
+            getCachedMarketData(
+              pair,
+              timeframe
+            )
+          ),
         ...result
       });
 
     }catch(error){
 
       console.error(
+        "Analyse:",
         error
       );
 
       if(
         error.message ===
-        "API_RATE_LIMIT"
+        "API_RATE_LIMIT" ||
+        error.message ===
+        "API_COOLDOWN"
       ){
 
         return res
@@ -667,7 +733,7 @@ app.post(
           .json({
             ok:false,
             error:
-              "API limit reached. Wait a few seconds."
+              "Twelve Data limit reached. Wait about 60 seconds and try again."
           });
       }
 
@@ -678,9 +744,7 @@ app.post(
           error:
             error.message
         });
-
     }
-
   }
 );
 
@@ -777,7 +841,7 @@ function openDemoTrade(
 
 
 /* =====================================
-   CLOSE REAL-PRICE DEMO TRADE
+   CLOSE DEMO TRADE
 ===================================== */
 
 async function closeDemoTrade(){
@@ -795,7 +859,8 @@ async function closeDemoTrade(){
       await getMarketData(
         trade.pair,
         config.timeframeMinutes,
-        2
+        2,
+        false
       );
 
     const last =
@@ -830,7 +895,6 @@ async function closeDemoTrade(){
 
         result =
           "LOSS";
-
       }
 
     }else{
@@ -851,9 +915,7 @@ async function closeDemoTrade(){
 
         result =
           "LOSS";
-
       }
-
     }
 
     let profit = 0;
@@ -874,8 +936,7 @@ async function closeDemoTrade(){
 
     }
     else if(
-      result ===
-      "LOSS"
+      result === "LOSS"
     ){
 
       profit =
@@ -887,7 +948,6 @@ async function closeDemoTrade(){
       state.losses++;
 
       state.consecutiveLosses++;
-
     }
 
     history.unshift({
@@ -904,7 +964,6 @@ async function closeDemoTrade(){
 
       closePrice:
         trade.currentPrice
-
     });
 
     history =
@@ -934,13 +993,12 @@ async function closeDemoTrade(){
   }catch(error){
 
     console.error(
-      "Close trade error:",
+      "Close trade:",
       error
     );
 
     state.lastMessage =
       "Waiting for market data to close trade.";
-
   }
 }
 
@@ -964,15 +1022,12 @@ async function scanMarket(){
   }
 
   if(
-    state.consecutiveLosses >=
-    config.maxConsecutiveLosses
+    Date.now() <
+    apiBlockedUntil
   ){
 
-    state.autoDemo =
-      false;
-
     state.lastMessage =
-      "AUTO stopped: loss limit.";
+      "API cooldown...";
 
     return;
   }
@@ -980,11 +1035,6 @@ async function scanMarket(){
   scanning = true;
 
   try{
-
-    /*
-      One pair per scan.
-      This protects the API limit.
-    */
 
     const pair =
       PAIRS[
@@ -1043,11 +1093,13 @@ async function scanMarket(){
 
     if(
       error.message ===
-      "API_RATE_LIMIT"
+      "API_RATE_LIMIT" ||
+      error.message ===
+      "API_COOLDOWN"
     ){
 
       state.lastMessage =
-        "API limit • waiting...";
+        "API limit • waiting 60s";
     }
     else{
 
@@ -1058,7 +1110,6 @@ async function scanMarket(){
   }finally{
 
     scanning = false;
-
   }
 }
 
@@ -1099,7 +1150,6 @@ setInterval(
     ){
 
       await closeDemoTrade();
-
     }
 
   },
@@ -1184,8 +1234,17 @@ app.get(
             )
           : 0,
 
-      apiCallsLastMinute:
-        requestTimes.length
+      apiCooldownSeconds:
+        Math.max(
+          0,
+          Math.ceil(
+            (
+              apiBlockedUntil -
+              Date.now()
+            ) /
+            1000
+          )
+        )
     });
 
   }
@@ -1209,7 +1268,7 @@ app.get(
 
 
 /* =====================================
-   START AUTO DEMO
+   START / STOP AUTO
 ===================================== */
 
 app.post(
@@ -1232,11 +1291,6 @@ app.post(
 
   }
 );
-
-
-/* =====================================
-   STOP AUTO DEMO
-===================================== */
 
 app.post(
   "/api/stop",
@@ -1290,5 +1344,8 @@ app.listen(
         : "API KEY: MISSING"
     );
 
+    console.log(
+      `AUTO SCAN: ${config.scanSeconds}s`
+    );
   }
 );
