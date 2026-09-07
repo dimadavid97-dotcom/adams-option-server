@@ -11,6 +11,8 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 
+const API_KEY = process.env.TWELVE_DATA_API_KEY;
+
 const PAIRS = [
   "EUR/USD",
   "GBP/USD",
@@ -23,7 +25,7 @@ const PAIRS = [
 ];
 
 const config = {
-  scanSeconds: Number(process.env.SCAN_SECONDS || 5),
+  scanSeconds: 10,
   riskPercent: Number(process.env.RISK_PERCENT || 1),
   minConfidence: Number(process.env.MIN_CONFIDENCE || 80),
   maxConsecutiveLosses: Number(
@@ -35,11 +37,11 @@ const config = {
 };
 
 let state = {
-  autoDemo:
-    String(process.env.AUTO_START || "true") === "true",
+  autoDemo: false,
 
-  balance:
-    Number(process.env.DEMO_BALANCE || 1000),
+  balance: Number(
+    process.env.DEMO_BALANCE || 1000
+  ),
 
   wins: 0,
   losses: 0,
@@ -49,248 +51,696 @@ let state = {
   currentSignal: "WAIT",
   currentConfidence: 0,
 
+  currentPrice: null,
+
   openTrade: null,
 
   lastScan: null,
-  lastMessage: "Server started"
+
+  lastMessage:
+    "Server started",
+
+  dataSource:
+    "Twelve Data"
 };
 
 let history = [];
+
 let scanning = false;
 
+let scanPairIndex = 0;
+
 
 /* =====================================
-   HELPERS
+   API RATE LIMIT
 ===================================== */
 
-function random(min, max) {
-  return Math.random() * (max - min) + min;
+const requestTimes = [];
+
+function canUseApi(){
+
+  const now = Date.now();
+
+  while(
+    requestTimes.length &&
+    now - requestTimes[0] > 60000
+  ){
+    requestTimes.shift();
+  }
+
+  return requestTimes.length < 8;
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
+function registerApiCall(){
 
-function basePrice(pair) {
-
-  const map = {
-    "EUR/USD": 1.10500,
-    "GBP/USD": 1.28500,
-    "EUR/GBP": 0.86000,
-    "USD/JPY": 147.200,
-    "AUD/USD": 0.66500,
-    "USD/CAD": 1.36500,
-    "USD/CHF": 0.80500,
-    "NZD/USD": 0.61500
-  };
-
-  return map[pair] || 1;
-}
-
-function priceScale(pair) {
-  return pair.includes("JPY")
-    ? 0.012
-    : 0.00012;
+  requestTimes.push(
+    Date.now()
+  );
 }
 
 
 /* =====================================
-   SIGNAL ENGINE - DEMO
+   TIMEFRAME
 ===================================== */
 
-function analysePair(pair) {
+function intervalFromMinutes(minutes){
 
-  const momentum = random(-100, 100);
-  const trend = random(-100, 100);
-  const strength = random(0, 100);
-  const volatility = random(15, 100);
+  const tf = Number(minutes);
 
-  const score =
-    momentum * 0.42 +
-    trend * 0.38 +
-    (strength - 50) * 0.14 +
-    (volatility - 50) * 0.06;
-
-  let direction = "WAIT";
-
-  if (score > 20) {
-    direction = "CALL";
-  }
-  else if (score < -20) {
-    direction = "PUT";
+  if(tf === 5){
+    return "5min";
   }
 
-  let confidence;
+  if(tf === 15){
+    return "15min";
+  }
 
-  if (direction === "WAIT") {
+  return "1min";
+}
+
+
+/* =====================================
+   TWELVE DATA
+===================================== */
+
+async function getMarketData(
+  pair,
+  timeframe = 1,
+  outputsize = 60
+){
+
+  if(!API_KEY){
+
+    throw new Error(
+      "TWELVE_DATA_API_KEY missing"
+    );
+  }
+
+  if(!canUseApi()){
+
+    throw new Error(
+      "API_RATE_LIMIT"
+    );
+  }
+
+  registerApiCall();
+
+  const interval =
+    intervalFromMinutes(
+      timeframe
+    );
+
+  const url =
+    "https://api.twelvedata.com/time_series" +
+    "?symbol=" +
+    encodeURIComponent(pair) +
+    "&interval=" +
+    encodeURIComponent(interval) +
+    "&outputsize=" +
+    outputsize +
+    "&apikey=" +
+    encodeURIComponent(API_KEY);
+
+  const response =
+    await fetch(url);
+
+  if(!response.ok){
+
+    throw new Error(
+      "Twelve Data HTTP " +
+      response.status
+    );
+  }
+
+  const data =
+    await response.json();
+
+  if(
+    data.status === "error"
+  ){
+
+    throw new Error(
+      data.message ||
+      "Twelve Data error"
+    );
+  }
+
+  if(
+    !Array.isArray(data.values) ||
+    !data.values.length
+  ){
+
+    throw new Error(
+      "No market data"
+    );
+  }
+
+  return data.values
+    .map(item => ({
+      datetime:
+        item.datetime,
+
+      open:
+        Number(item.open),
+
+      high:
+        Number(item.high),
+
+      low:
+        Number(item.low),
+
+      close:
+        Number(item.close)
+    }))
+    .reverse();
+}
+
+
+/* =====================================
+   INDICATORS
+===================================== */
+
+function calculateEMA(
+  values,
+  period
+){
+
+  if(
+    values.length <
+    period
+  ){
+    return null;
+  }
+
+  const multiplier =
+    2 / (period + 1);
+
+  let ema =
+    values
+      .slice(0, period)
+      .reduce(
+        (sum, value) =>
+          sum + value,
+        0
+      ) / period;
+
+  for(
+    let i = period;
+    i < values.length;
+    i++
+  ){
+
+    ema =
+      (
+        values[i] - ema
+      ) *
+      multiplier +
+      ema;
+  }
+
+  return ema;
+}
+
+
+function calculateRSI(
+  values,
+  period = 14
+){
+
+  if(
+    values.length <
+    period + 1
+  ){
+    return null;
+  }
+
+  let gains = 0;
+  let losses = 0;
+
+  for(
+    let i = 1;
+    i <= period;
+    i++
+  ){
+
+    const change =
+      values[i] -
+      values[i - 1];
+
+    if(change >= 0){
+
+      gains += change;
+
+    }else{
+
+      losses +=
+        Math.abs(change);
+    }
+  }
+
+  let avgGain =
+    gains / period;
+
+  let avgLoss =
+    losses / period;
+
+  for(
+    let i = period + 1;
+    i < values.length;
+    i++
+  ){
+
+    const change =
+      values[i] -
+      values[i - 1];
+
+    const gain =
+      change > 0
+        ? change
+        : 0;
+
+    const loss =
+      change < 0
+        ? Math.abs(change)
+        : 0;
+
+    avgGain =
+      (
+        avgGain *
+        (period - 1) +
+        gain
+      ) / period;
+
+    avgLoss =
+      (
+        avgLoss *
+        (period - 1) +
+        loss
+      ) / period;
+  }
+
+  if(avgLoss === 0){
+    return 100;
+  }
+
+  const rs =
+    avgGain /
+    avgLoss;
+
+  return (
+    100 -
+    100 / (1 + rs)
+  );
+}
+
+
+/* =====================================
+   REAL SIGNAL ENGINE
+===================================== */
+
+async function analysePair(
+  pair,
+  timeframe = 1
+){
+
+  const candles =
+    await getMarketData(
+      pair,
+      timeframe,
+      60
+    );
+
+  const closes =
+    candles.map(
+      candle =>
+        candle.close
+    );
+
+  const price =
+    closes[
+      closes.length - 1
+    ];
+
+  const previousPrice =
+    closes[
+      closes.length - 2
+    ];
+
+  const ema9 =
+    calculateEMA(
+      closes,
+      9
+    );
+
+  const ema21 =
+    calculateEMA(
+      closes,
+      21
+    );
+
+  const rsi =
+    calculateRSI(
+      closes,
+      14
+    );
+
+  if(
+    ema9 === null ||
+    ema21 === null ||
+    rsi === null
+  ){
+
+    return {
+      pair,
+      direction:"WAIT",
+      confidence:0,
+      price,
+      ema9,
+      ema21,
+      rsi
+    };
+  }
+
+  let bullishScore = 0;
+  let bearishScore = 0;
+
+  /*
+    EMA TREND
+  */
+
+  if(ema9 > ema21){
+
+    bullishScore += 35;
+
+  }
+
+  if(ema9 < ema21){
+
+    bearishScore += 35;
+
+  }
+
+  /*
+    PRICE VS EMA
+  */
+
+  if(price > ema9){
+
+    bullishScore += 20;
+
+  }
+
+  if(price < ema9){
+
+    bearishScore += 20;
+
+  }
+
+  /*
+    RSI
+  */
+
+  if(
+    rsi >= 52 &&
+    rsi <= 70
+  ){
+
+    bullishScore += 25;
+
+  }
+
+  if(
+    rsi <= 48 &&
+    rsi >= 30
+  ){
+
+    bearishScore += 25;
+
+  }
+
+  /*
+    MOMENTUM
+  */
+
+  if(
+    price >
+    previousPrice
+  ){
+
+    bullishScore += 20;
+
+  }
+
+  if(
+    price <
+    previousPrice
+  ){
+
+    bearishScore += 20;
+
+  }
+
+  let direction =
+    "WAIT";
+
+  let confidence = 0;
+
+  if(
+    bullishScore >= 65 &&
+    bullishScore >
+    bearishScore
+  ){
+
+    direction =
+      "CALL";
 
     confidence =
-      Math.round(
-        random(50, 74)
-      );
+      bullishScore;
 
   }
-  else {
+  else if(
+    bearishScore >= 65 &&
+    bearishScore >
+    bullishScore
+  ){
+
+    direction =
+      "PUT";
 
     confidence =
-      Math.round(
-        clamp(
-          60 +
-          Math.abs(score) * 0.38 +
-          random(-5, 7),
-          55,
-          96
-        )
+      bearishScore;
+
+  }
+  else{
+
+    direction =
+      "WAIT";
+
+    confidence =
+      Math.max(
+        bullishScore,
+        bearishScore
       );
   }
+
+  confidence =
+    Math.min(
+      95,
+      Math.round(
+        confidence
+      )
+    );
 
   return {
     pair,
     direction,
     confidence,
-    score
+
+    price,
+
+    ema9:
+      Number(
+        ema9.toFixed(6)
+      ),
+
+    ema21:
+      Number(
+        ema21.toFixed(6)
+      ),
+
+    rsi:
+      Number(
+        rsi.toFixed(2)
+      ),
+
+    bullishScore,
+    bearishScore,
+
+    timeframe
   };
 }
 
 
 /* =====================================
-   SCAN ALL PAIRS
+   MANUAL ANALYSE
 ===================================== */
 
-function scanMarket() {
+app.post(
+  "/api/analyse",
+  async (req,res) => {
 
-  if (!state.autoDemo) return;
-  if (state.openTrade) return;
-  if (scanning) return;
+    try{
 
-  scanning = true;
+      const pair =
+        req.body?.pair ||
+        "EUR/USD";
 
-  try {
+      const timeframe =
+        Number(
+          req.body?.timeframe ||
+          1
+        );
 
-    if (
-      state.consecutiveLosses >=
-      config.maxConsecutiveLosses
-    ) {
+      if(
+        !PAIRS.includes(pair)
+      ){
 
-      state.autoDemo = false;
+        return res
+          .status(400)
+          .json({
+            ok:false,
+            error:
+              "Invalid Forex pair"
+          });
+      }
+
+      const result =
+        await analysePair(
+          pair,
+          timeframe
+        );
+
+      state.currentPair =
+        result.pair;
+
+      state.currentSignal =
+        result.direction;
+
+      state.currentConfidence =
+        result.confidence;
+
+      state.currentPrice =
+        result.price;
+
+      state.lastScan =
+        new Date()
+          .toISOString();
 
       state.lastMessage =
-        "AUTO stopped: loss limit reached.";
+        `${result.pair} ${result.direction} ${result.confidence}%`;
 
-      return;
-    }
-
-    state.lastScan =
-      new Date().toISOString();
-
-    const results =
-      PAIRS.map(pair => analysePair(pair));
-
-    const valid =
-      results.filter(
-        result =>
-          result.direction !== "WAIT"
+      console.log(
+        "REAL MARKET:",
+        state.lastMessage
       );
 
-    if (!valid.length) {
+      res.json({
+        ok:true,
+        source:
+          "Twelve Data",
+        ...result
+      });
 
-      state.currentPair = null;
-      state.currentSignal = "WAIT";
-      state.currentConfidence = 0;
+    }catch(error){
 
-      state.lastMessage =
-        "No valid signal.";
+      console.error(
+        error
+      );
 
-      return;
-    }
+      if(
+        error.message ===
+        "API_RATE_LIMIT"
+      ){
 
-    valid.sort(
-      (a, b) =>
-        b.confidence - a.confidence
-    );
+        return res
+          .status(429)
+          .json({
+            ok:false,
+            error:
+              "API limit reached. Wait a few seconds."
+          });
+      }
 
-    const best = valid[0];
-
-    state.currentPair =
-      best.pair;
-
-    state.currentSignal =
-      best.direction;
-
-    state.currentConfidence =
-      best.confidence;
-
-    state.lastMessage =
-      `BEST ${best.pair} ${best.direction} ${best.confidence}%`;
-
-    console.log(
-      new Date().toISOString(),
-      state.lastMessage
-    );
-
-    if (
-      best.confidence >=
-      config.minConfidence
-    ) {
-
-      openDemoTrade(best);
+      res
+        .status(500)
+        .json({
+          ok:false,
+          error:
+            error.message
+        });
 
     }
 
   }
-  finally {
-
-    scanning = false;
-
-  }
-}
+);
 
 
 /* =====================================
    OPEN DEMO TRADE
 ===================================== */
 
-function openDemoTrade(signal) {
+function openDemoTrade(
+  signal
+){
 
-  if (state.openTrade) return;
+  if(state.openTrade){
+    return;
+  }
+
+  if(
+    signal.direction ===
+    "WAIT"
+  ){
+    return;
+  }
 
   const amount =
-    Math.max(
-      0.50,
-      state.balance *
-      config.riskPercent /
-      100
+    Math.min(
+      state.balance,
+      Math.max(
+        0.50,
+        state.balance *
+        config.riskPercent /
+        100
+      )
     );
 
-  if (
-    state.balance <= 0 ||
-    amount > state.balance
-  ) {
+  if(
+    amount <= 0 ||
+    state.balance <= 0
+  ){
 
-    state.autoDemo = false;
+    state.autoDemo =
+      false;
 
     state.lastMessage =
-      "AUTO stopped: demo balance empty.";
+      "AUTO stopped: balance empty.";
 
     return;
   }
 
-  const pair = signal.pair;
-
-  const entry =
-    basePrice(pair) +
-    random(-1, 1) *
-    priceScale(pair) *
-    4;
-
   const durationSeconds =
-    config.timeframeMinutes * 60;
+    config.timeframeMinutes *
+    60;
 
   state.openTrade = {
 
-    id: Date.now().toString(),
+    id:
+      Date.now()
+        .toString(),
 
-    pair,
+    pair:
+      signal.pair,
 
     direction:
       signal.direction,
@@ -300,17 +750,21 @@ function openDemoTrade(signal) {
 
     amount,
 
-    entry,
+    entry:
+      signal.price,
 
-    currentPrice: entry,
+    currentPrice:
+      signal.price,
 
     openedAt:
-      new Date().toISOString(),
+      new Date()
+        .toISOString(),
 
     closesAt:
       new Date(
         Date.now() +
-        durationSeconds * 1000
+        durationSeconds *
+        1000
       ).toISOString(),
 
     remainingSeconds:
@@ -318,408 +772,523 @@ function openDemoTrade(signal) {
   };
 
   state.lastMessage =
-    `OPEN ${pair} ${signal.direction} ${signal.confidence}%`;
-
-  console.log(
-    new Date().toISOString(),
-    state.lastMessage
-  );
+    `OPEN ${signal.pair} ${signal.direction} ${signal.confidence}%`;
 }
 
 
 /* =====================================
-   UPDATE DEMO PRICE
+   CLOSE REAL-PRICE DEMO TRADE
 ===================================== */
 
-function updateOpenTrade() {
+async function closeDemoTrade(){
 
   const trade =
     state.openTrade;
 
-  if (!trade) return;
-
-  const scale =
-    priceScale(trade.pair);
-
-  const directionalBias =
-    (
-      trade.confidence - 50
-    ) /
-    50 *
-    scale *
-    (
-      trade.direction === "CALL"
-        ? 0.16
-        : -0.16
-    );
-
-  trade.currentPrice +=
-    random(-scale, scale) +
-    directionalBias;
-
-  trade.remainingSeconds--;
-
-  if (
-    trade.remainingSeconds <= 0
-  ) {
-
-    closeDemoTrade();
-
+  if(!trade){
+    return;
   }
-}
 
+  try{
 
-/* =====================================
-   CLOSE DEMO TRADE
-===================================== */
+    const candles =
+      await getMarketData(
+        trade.pair,
+        config.timeframeMinutes,
+        2
+      );
 
-function closeDemoTrade() {
+    const last =
+      candles[
+        candles.length - 1
+      ];
 
-  const trade =
-    state.openTrade;
+    trade.currentPrice =
+      last.close;
 
-  if (!trade) return;
+    let result =
+      "DRAW";
 
-  let result = "DRAW";
+    if(
+      trade.direction ===
+      "CALL"
+    ){
 
-  if (
-    trade.direction === "CALL"
-  ) {
+      if(
+        trade.currentPrice >
+        trade.entry
+      ){
 
-    if (
-      trade.currentPrice >
-      trade.entry
-    ) {
+        result =
+          "WIN";
 
-      result = "WIN";
+      }
+      else if(
+        trade.currentPrice <
+        trade.entry
+      ){
 
-    }
-    else if (
-      trade.currentPrice <
-      trade.entry
-    ) {
+        result =
+          "LOSS";
 
-      result = "LOSS";
+      }
 
-    }
+    }else{
 
-  }
-  else {
+      if(
+        trade.currentPrice <
+        trade.entry
+      ){
 
-    if (
-      trade.currentPrice <
-      trade.entry
-    ) {
+        result =
+          "WIN";
 
-      result = "WIN";
+      }
+      else if(
+        trade.currentPrice >
+        trade.entry
+      ){
 
-    }
-    else if (
-      trade.currentPrice >
-      trade.entry
-    ) {
+        result =
+          "LOSS";
 
-      result = "LOSS";
+      }
 
     }
 
-  }
+    let profit = 0;
 
-  let profit = 0;
+    if(result === "WIN"){
 
-  if (result === "WIN") {
+      profit =
+        trade.amount *
+        0.82;
 
-    profit =
-      trade.amount * 0.82;
+      state.balance +=
+        profit;
 
-    state.balance +=
-      profit;
+      state.wins++;
 
-    state.wins++;
+      state.consecutiveLosses =
+        0;
 
-    state.consecutiveLosses = 0;
+    }
+    else if(
+      result ===
+      "LOSS"
+    ){
 
-  }
-  else if (
-    result === "LOSS"
-  ) {
+      profit =
+        -trade.amount;
 
-    profit =
-      -trade.amount;
+      state.balance -=
+        trade.amount;
 
-    state.balance -=
-      trade.amount;
+      state.losses++;
 
-    state.losses++;
+      state.consecutiveLosses++;
 
-    state.consecutiveLosses++;
+    }
 
-  }
+    history.unshift({
 
-  history.unshift({
+      ...trade,
 
-    ...trade,
+      result,
 
-    result,
+      profit,
 
-    profit,
+      closedAt:
+        new Date()
+          .toISOString(),
 
-    closedAt:
-      new Date().toISOString(),
+      closePrice:
+        trade.currentPrice
 
-    closePrice:
-      trade.currentPrice
-  });
+    });
 
-  history =
-    history.slice(0, 200);
+    history =
+      history.slice(
+        0,
+        200
+      );
 
-  state.openTrade = null;
-
-  state.lastMessage =
-    `${result} ${trade.pair} ${profit >= 0 ? "+" : ""}£${profit.toFixed(2)}`;
-
-  console.log(
-    new Date().toISOString(),
-    state.lastMessage
-  );
-
-  if (
-    state.consecutiveLosses >=
-    config.maxConsecutiveLosses
-  ) {
-
-    state.autoDemo = false;
+    state.openTrade =
+      null;
 
     state.lastMessage =
-      "AUTO stopped after loss limit.";
+      `${result} ${trade.pair} ${profit >= 0 ? "+" : ""}£${profit.toFixed(2)}`;
+
+    if(
+      state.consecutiveLosses >=
+      config.maxConsecutiveLosses
+    ){
+
+      state.autoDemo =
+        false;
+
+      state.lastMessage =
+        "AUTO stopped after loss limit.";
+    }
+
+  }catch(error){
+
+    console.error(
+      "Close trade error:",
+      error
+    );
+
+    state.lastMessage =
+      "Waiting for market data to close trade.";
 
   }
 }
+
+
+/* =====================================
+   AUTO SCAN
+===================================== */
+
+async function scanMarket(){
+
+  if(!state.autoDemo){
+    return;
+  }
+
+  if(state.openTrade){
+    return;
+  }
+
+  if(scanning){
+    return;
+  }
+
+  if(
+    state.consecutiveLosses >=
+    config.maxConsecutiveLosses
+  ){
+
+    state.autoDemo =
+      false;
+
+    state.lastMessage =
+      "AUTO stopped: loss limit.";
+
+    return;
+  }
+
+  scanning = true;
+
+  try{
+
+    /*
+      One pair per scan.
+      This protects the API limit.
+    */
+
+    const pair =
+      PAIRS[
+        scanPairIndex %
+        PAIRS.length
+      ];
+
+    scanPairIndex++;
+
+    state.lastMessage =
+      `Scanning ${pair}...`;
+
+    const result =
+      await analysePair(
+        pair,
+        config.timeframeMinutes
+      );
+
+    state.currentPair =
+      result.pair;
+
+    state.currentSignal =
+      result.direction;
+
+    state.currentConfidence =
+      result.confidence;
+
+    state.currentPrice =
+      result.price;
+
+    state.lastScan =
+      new Date()
+        .toISOString();
+
+    state.lastMessage =
+      `${result.pair} ${result.direction} ${result.confidence}%`;
+
+    if(
+      result.direction !==
+      "WAIT" &&
+      result.confidence >=
+      config.minConfidence
+    ){
+
+      openDemoTrade(
+        result
+      );
+    }
+
+  }catch(error){
+
+    console.error(
+      "AUTO:",
+      error
+    );
+
+    if(
+      error.message ===
+      "API_RATE_LIMIT"
+    ){
+
+      state.lastMessage =
+        "API limit • waiting...";
+    }
+    else{
+
+      state.lastMessage =
+        "Market data error";
+    }
+
+  }finally{
+
+    scanning = false;
+
+  }
+}
+
+
+/* =====================================
+   TRADE TIMER
+===================================== */
+
+setInterval(
+  async () => {
+
+    if(
+      !state.openTrade
+    ){
+      return;
+    }
+
+    const closesAt =
+      new Date(
+        state.openTrade.closesAt
+      ).getTime();
+
+    state.openTrade.remainingSeconds =
+      Math.max(
+        0,
+        Math.ceil(
+          (
+            closesAt -
+            Date.now()
+          ) /
+          1000
+        )
+      );
+
+    if(
+      state.openTrade
+        .remainingSeconds <= 0
+    ){
+
+      await closeDemoTrade();
+
+    }
+
+  },
+  1000
+);
 
 
 /* =====================================
    HOME
 ===================================== */
 
-app.get("/", (req, res) => {
+app.get(
+  "/",
+  (req,res) => {
 
-  res.json({
-    app: "ADAMS OPTION SERVER",
-    mode: "DEMO",
-    status: "online"
-  });
+    res.json({
+      app:
+        "ADAMS OPTION SERVER",
 
-});
+      mode:
+        "REAL DATA / DEMO TRADES",
+
+      data:
+        "TWELVE DATA",
+
+      status:
+        "online"
+    });
+
+  }
+);
 
 
 /* =====================================
    HEALTH
 ===================================== */
 
-app.get("/health", (req, res) => {
+app.get(
+  "/health",
+  (req,res) => {
 
-  res.json({
-    ok: true,
-    time:
-      new Date().toISOString()
-  });
-
-});
-
-
-/* =====================================
-   MANUAL ANALYSE API
-===================================== */
-
-app.post("/api/analyse", (req, res) => {
-
-  const pair =
-    req.body?.pair || "EUR/USD";
-
-  if (!PAIRS.includes(pair)) {
-
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid Forex pair"
+    res.json({
+      ok:true,
+      dataSource:
+        "Twelve Data",
+      time:
+        new Date()
+          .toISOString()
     });
 
   }
-
-  const result =
-    analysePair(pair);
-
-  state.currentPair =
-    result.pair;
-
-  state.currentSignal =
-    result.direction;
-
-  state.currentConfidence =
-    result.confidence;
-
-  state.lastScan =
-    new Date().toISOString();
-
-  state.lastMessage =
-    `${result.pair} ${result.direction} ${result.confidence}%`;
-
-  console.log(
-    "MANUAL:",
-    state.lastMessage
-  );
-
-  res.json({
-    ok: true,
-
-    pair:
-      result.pair,
-
-    direction:
-      result.direction,
-
-    confidence:
-      result.confidence,
-
-    score:
-      result.score,
-
-    timeframe:
-      Number(
-        req.body?.timeframe ||
-        config.timeframeMinutes
-      )
-  });
-
-});
+);
 
 
 /* =====================================
-   SERVER STATE
+   STATE
 ===================================== */
 
-app.get("/api/state", (req, res) => {
+app.get(
+  "/api/state",
+  (req,res) => {
 
-  const total =
-    state.wins +
-    state.losses;
+    const total =
+      state.wins +
+      state.losses;
 
-  res.json({
+    res.json({
 
-    ...state,
+      ...state,
 
-    config,
+      config,
 
-    trades: total,
+      trades:
+        total,
 
-    winRate:
-      total
-        ? Math.round(
-            state.wins /
-            total *
-            100
-          )
-        : 0
-  });
+      winRate:
+        total
+          ? Math.round(
+              state.wins /
+              total *
+              100
+            )
+          : 0,
 
-});
+      apiCallsLastMinute:
+        requestTimes.length
+    });
+
+  }
+);
 
 
 /* =====================================
    HISTORY
 ===================================== */
 
-app.get("/api/history", (req, res) => {
+app.get(
+  "/api/history",
+  (req,res) => {
 
-  res.json(history);
+    res.json(
+      history
+    );
 
-});
+  }
+);
 
 
 /* =====================================
    START AUTO DEMO
 ===================================== */
 
-app.post("/api/start", (req, res) => {
+app.post(
+  "/api/start",
+  (req,res) => {
 
-  state.autoDemo = true;
+    state.autoDemo =
+      true;
 
-  state.consecutiveLosses = 0;
+    state.consecutiveLosses =
+      0;
 
-  state.lastMessage =
-    "AUTO DEMO started";
+    state.lastMessage =
+      "REAL DATA AUTO DEMO started";
 
-  scanMarket();
+    res.json({
+      ok:true,
+      autoDemo:true
+    });
 
-  res.json({
-    ok: true,
-    autoDemo:
-      state.autoDemo
-  });
-
-});
+  }
+);
 
 
 /* =====================================
    STOP AUTO DEMO
 ===================================== */
 
-app.post("/api/stop", (req, res) => {
+app.post(
+  "/api/stop",
+  (req,res) => {
 
-  state.autoDemo = false;
+    state.autoDemo =
+      false;
 
-  state.lastMessage =
-    "AUTO DEMO stopped";
+    state.lastMessage =
+      "AUTO DEMO stopped";
 
-  res.json({
-    ok: true,
-    autoDemo:
-      state.autoDemo
-  });
+    res.json({
+      ok:true,
+      autoDemo:false
+    });
 
-});
+  }
+);
 
 
 /* =====================================
-   SERVER TIMERS
+   AUTO TIMER
 ===================================== */
-
-setInterval(
-  updateOpenTrade,
-  1000
-);
 
 setInterval(
   scanMarket,
-  config.scanSeconds * 1000
+  config.scanSeconds *
+  1000
 );
 
 
 /* =====================================
-   START SERVER
+   START
 ===================================== */
 
-app.listen(PORT, () => {
+app.listen(
+  PORT,
+  () => {
 
-  console.log(
-    `ADAMS OPTION SERVER running on port ${PORT}`
-  );
+    console.log(
+      `ADAMS OPTION SERVER running on port ${PORT}`
+    );
 
-  console.log(
-    `AUTO DEMO: ${
-      state.autoDemo
-        ? "ON"
-        : "OFF"
-    }`
-  );
+    console.log(
+      "Market data: Twelve Data"
+    );
 
-  if (state.autoDemo) {
-
-    setTimeout(
-      scanMarket,
-      1500
+    console.log(
+      API_KEY
+        ? "API KEY: loaded"
+        : "API KEY: MISSING"
     );
 
   }
-
-});
+);
