@@ -22,9 +22,13 @@ const ONESIGNAL_APP_ID =
 const ONESIGNAL_REST_API_KEY =
   process.env.ONESIGNAL_REST_API_KEY || "";
 
+const MIN_CONFIDENCE =
+  Number(process.env.MIN_CONFIDENCE || 80);
+
 
 // =====================================================
-// POCKET OPTION PAIRS
+// ADAMS OPTION — POCKET MODE
+// DEMO SIGNALS / MANUAL EXECUTION
 // =====================================================
 
 const PAIRS = [
@@ -38,16 +42,25 @@ const PAIRS = [
   "NZD/USD"
 ];
 
+const TIMEFRAMES = [
+  "M1",
+  "M5",
+  "M15"
+];
 
-// =====================================================
-// SETTINGS
-// =====================================================
+const TF_SECONDS = {
+  M1: 60,
+  M5: 300,
+  M15: 900
+};
 
 const HISTORY_FILE = "./history.json";
 
 const MAX_HISTORY = 500;
 
-const MAX_CANDLES = 200;
+const MAX_CANDLES = 220;
+
+const MAX_OPEN_TRADES = 2;
 
 const HEARTBEAT_MS = 10000;
 
@@ -55,24 +68,21 @@ const PING_MS = 30000;
 
 const RECONNECT_MAX_MS = 30000;
 
+const STALE_FEED_MS = 120000;
 
-// Build URLs without exposing keys in source code.
 
-const TD_WS_BASE = [
-  "wss:",
-  "",
-  "ws.twelvedata.com",
-  "v1",
-  "quotes",
-  "price"
-].join("/");
+// =====================================================
+// URLS
+// =====================================================
 
-const ONESIGNAL_URL = [
-  "https:",
-  "",
-  "api.onesignal.com",
-  "notifications"
-].join("/");
+const TD_WS_BASE =
+  "wss://ws.twelvedata.com/v1/quotes/price";
+
+const TD_TIME_SERIES =
+  "https://api.twelvedata.com/time_series";
+
+const ONESIGNAL_URL =
+  "https://api.onesignal.com/notifications";
 
 
 // =====================================================
@@ -87,7 +97,6 @@ const openTrades = new Map();
 
 const lastTradeTime = new Map();
 
-
 let history = [];
 
 let wins = 0;
@@ -95,7 +104,6 @@ let wins = 0;
 let losses = 0;
 
 let draws = 0;
-
 
 let ws = null;
 
@@ -117,10 +125,20 @@ let pingTimer = null;
 
 let shuttingDown = false;
 
+let warmingUp = false;
+
 
 // =====================================================
 // HELPERS
 // =====================================================
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function round(value, digits = 5) {
 
@@ -128,11 +146,8 @@ function round(value, digits = 5) {
     return null;
   }
 
-  return Number(
-    value.toFixed(digits)
-  );
+  return Number(value.toFixed(digits));
 }
-
 
 function digitsForPair(pair) {
 
@@ -140,7 +155,6 @@ function digitsForPair(pair) {
     ? 3
     : 5;
 }
-
 
 function formatPrice(pair, value) {
 
@@ -150,65 +164,79 @@ function formatPrice(pair, value) {
   );
 }
 
-
-function nowIso() {
-
-  return new Date()
-    .toISOString();
-}
-
-
-function tradeKey(
-  pair,
-  timeframe
-) {
+function tradeKey(pair, timeframe) {
 
   return `${pair}|${timeframe}`;
 }
 
-
 function expiryMs(timeframe) {
 
-  return timeframe === "M5"
-    ? 5 * 60 * 1000
-    : 60 * 1000;
-}
+  if (timeframe === "M15") {
+    return 15 * 60 * 1000;
+  }
 
+  if (timeframe === "M5") {
+    return 5 * 60 * 1000;
+  }
+
+  return 60 * 1000;
+}
 
 function cooldownMs(timeframe) {
 
-  return timeframe === "M5"
-    ? 5 * 60 * 1000
-    : 2 * 60 * 1000;
+  if (timeframe === "M15") {
+    return 15 * 60 * 1000;
+  }
+
+  if (timeframe === "M5") {
+    return 5 * 60 * 1000;
+  }
+
+  return 2 * 60 * 1000;
+}
+
+function feedIsFresh(state) {
+
+  if (!state?.lastTickAt) {
+    return false;
+  }
+
+  const age =
+    Date.now() -
+    new Date(state.lastTickAt).getTime();
+
+  return age <= STALE_FEED_MS;
 }
 
 
 // =====================================================
-// PAIR STATE
+// STATE
 // =====================================================
 
 function ensureState(pair) {
 
   if (!states.has(pair)) {
 
-    states.set(
+    states.set(pair, {
+
       pair,
-      {
-        pair,
 
-        lastPrice: null,
+      lastPrice: null,
 
-        lastTickAt: null,
+      lastTickAt: null,
 
-        currentM1: null,
+      current: {
+        M1: null,
+        M5: null,
+        M15: null
+      },
 
-        currentM5: null,
-
-        closedM1: [],
-
-        closedM5: []
+      closed: {
+        M1: [],
+        M5: [],
+        M15: []
       }
-    );
+    });
   }
 
   return states.get(pair);
@@ -223,12 +251,7 @@ function loadHistory() {
 
   try {
 
-    if (
-      !fs.existsSync(
-        HISTORY_FILE
-      )
-    ) {
-
+    if (!fs.existsSync(HISTORY_FILE)) {
       return;
     }
 
@@ -240,9 +263,7 @@ function loadHistory() {
         )
       );
 
-    if (
-      Array.isArray(parsed)
-    ) {
+    if (Array.isArray(parsed)) {
 
       history =
         parsed.slice(
@@ -261,18 +282,15 @@ function loadHistory() {
     history = [];
   }
 
-
   wins =
     history.filter(
       x => x.result === "WIN"
     ).length;
 
-
   losses =
     history.filter(
       x => x.result === "LOST"
     ).length;
-
 
   draws =
     history.filter(
@@ -280,19 +298,16 @@ function loadHistory() {
     ).length;
 }
 
-
 function saveHistory() {
 
   try {
 
     fs.writeFileSync(
+
       HISTORY_FILE,
 
       JSON.stringify(
-        history.slice(
-          0,
-          MAX_HISTORY
-        ),
+        history.slice(0, MAX_HISTORY),
         null,
         2
       ),
@@ -309,7 +324,6 @@ function saveHistory() {
   }
 }
 
-
 function addHistory(trade) {
 
   history.unshift(trade);
@@ -320,56 +334,37 @@ function addHistory(trade) {
       MAX_HISTORY
     );
 
-
-  if (
-    trade.result === "WIN"
-  ) {
-
+  if (trade.result === "WIN") {
     wins += 1;
   }
 
-
-  if (
-    trade.result === "LOST"
-  ) {
-
+  if (trade.result === "LOST") {
     losses += 1;
   }
 
-
-  if (
-    trade.result === "DRAW"
-  ) {
-
+  if (trade.result === "DRAW") {
     draws += 1;
   }
-
 
   saveHistory();
 }
 
 
 // =====================================================
-// EMA
+// INDICATORS
 // =====================================================
 
-function ema(
-  values,
-  period
-) {
+function ema(values, period) {
 
   if (
     !values ||
     values.length < period
   ) {
-
     return null;
   }
 
-
   const multiplier =
     2 / (period + 1);
-
 
   let current =
     values
@@ -379,7 +374,6 @@ function ema(
           sum + value,
         0
       ) / period;
-
 
   for (
     let i = period;
@@ -396,40 +390,27 @@ function ema(
       current;
   }
 
-
   return current;
 }
 
-
-// =====================================================
-// RSI
-// =====================================================
-
-function rsi(
-  values,
-  period = 7
-) {
+function rsi(values, period = 14) {
 
   if (
     !values ||
     values.length <
       period + 1
   ) {
-
     return null;
   }
-
 
   let gains = 0;
 
   let lossesLocal = 0;
 
-
   const start =
     values.length -
     period -
     1;
-
 
   for (
     let i = start + 1;
@@ -441,10 +422,7 @@ function rsi(
       values[i] -
       values[i - 1];
 
-
-    if (
-      diff > 0
-    ) {
+    if (diff > 0) {
 
       gains += diff;
 
@@ -455,27 +433,18 @@ function rsi(
     }
   }
 
-
   const avgGain =
     gains / period;
-
 
   const avgLoss =
     lossesLocal / period;
 
-
-  if (
-    avgLoss === 0
-  ) {
-
+  if (avgLoss === 0) {
     return 100;
   }
 
-
   const rs =
-    avgGain /
-    avgLoss;
-
+    avgGain / avgLoss;
 
   return (
     100 -
@@ -483,36 +452,88 @@ function rsi(
   );
 }
 
-
-// =====================================================
-// MOMENTUM
-// =====================================================
-
-function momentum(
-  values,
-  period = 3
-) {
+function momentum(values, period = 3) {
 
   if (
     !values ||
     values.length <= period
   ) {
-
     return 0;
   }
-
 
   return (
     values[
       values.length - 1
     ] -
-
     values[
       values.length -
       1 -
       period
     ]
   );
+}
+
+
+// =====================================================
+// MULTI TIMEFRAME CONFIRMATION
+// =====================================================
+
+function confirmationForPair(
+  pair,
+  timeframe,
+  side
+) {
+
+  const check = [];
+
+  if (timeframe === "M1") {
+
+    check.push(
+      signals.get(
+        tradeKey(pair, "M5")
+      )
+    );
+  }
+
+  if (timeframe === "M5") {
+
+    check.push(
+      signals.get(
+        tradeKey(pair, "M15")
+      )
+    );
+  }
+
+  if (timeframe === "M15") {
+
+    check.push(
+      signals.get(
+        tradeKey(pair, "M5")
+      )
+    );
+  }
+
+  let bonus = 0;
+
+  for (const signal of check) {
+
+    if (!signal) {
+      continue;
+    }
+
+    if (signal.side === side) {
+      bonus += 6;
+    }
+
+    if (
+      signal.side !== "WAIT" &&
+      signal.side !== side
+    ) {
+      bonus -= 8;
+    }
+  }
+
+  return bonus;
 }
 
 
@@ -529,10 +550,8 @@ function analyseSignal(
 
   if (
     !candles ||
-    candles.length < 8 ||
-    !Number.isFinite(
-      livePrice
-    )
+    candles.length < 20 ||
+    !Number.isFinite(livePrice)
   ) {
 
     return {
@@ -545,8 +564,7 @@ function analyseSignal(
 
       confidence: 0,
 
-      reason:
-        "WARMING_UP",
+      reason: "WARMING_UP",
 
       bars:
         candles?.length || 0,
@@ -556,176 +574,159 @@ function analyseSignal(
     };
   }
 
-
   const recent =
-    candles.slice(-40);
-
+    candles.slice(-80);
 
   const closes =
     recent.map(
-      candle =>
-        candle.close
+      candle => candle.close
     );
-
 
   const last =
     recent[
       recent.length - 1
     ];
 
-
   const fast =
-    ema(
-      closes,
-      3
-    );
-
+    ema(closes, 5);
 
   const slow =
-    ema(
-      closes,
-      7
-    );
-
+    ema(closes, 13);
 
   const currentRsi =
-    rsi(
-      closes,
-      7
-    );
-
+    rsi(closes, 14);
 
   const mom =
-    momentum(
-      closes,
-      3
-    );
+    momentum(closes, 3);
 
+  if (
+    !Number.isFinite(fast) ||
+    !Number.isFinite(slow) ||
+    !Number.isFinite(currentRsi)
+  ) {
+
+    return {
+
+      pair,
+      timeframe,
+      side: "WAIT",
+      confidence: 0,
+      reason: "INDICATORS_WARMING",
+      bars: recent.length,
+      updatedAt: nowIso()
+    };
+  }
 
   let score = 0;
 
+  // EMA TREND
+
+  if (fast > slow) {
+    score += 3;
+  }
+
+  if (fast < slow) {
+    score -= 3;
+  }
+
+  // PRICE VS EMA
+
+  if (last.close > fast) {
+    score += 1;
+  }
+
+  if (last.close < fast) {
+    score -= 1;
+  }
+
+  // RSI
 
   if (
-    fast > slow
+    currentRsi >= 54 &&
+    currentRsi <= 72
   ) {
-
     score += 2;
   }
 
-
   if (
-    fast < slow
+    currentRsi <= 46 &&
+    currentRsi >= 28
   ) {
-
     score -= 2;
   }
 
+  // MOMENTUM
 
-  if (
-    last.close > fast
-  ) {
-
+  if (mom > 0) {
     score += 1;
   }
 
-
-  if (
-    last.close < fast
-  ) {
-
+  if (mom < 0) {
     score -= 1;
   }
 
+  // LAST CANDLE
 
-  if (
-    currentRsi >= 55 &&
-    currentRsi <= 72
-  ) {
-
+  if (last.close > last.open) {
     score += 1;
   }
 
-
-  if (
-    currentRsi <= 45 &&
-    currentRsi >= 28
-  ) {
-
+  if (last.close < last.open) {
     score -= 1;
   }
 
+  let side = "WAIT";
 
-  if (
-    mom > 0
-  ) {
-
-    score += 1;
+  if (score >= 6) {
+    side = "CALL";
   }
 
-
-  if (
-    mom < 0
-  ) {
-
-    score -= 1;
+  if (score <= -6) {
+    side = "PUT";
   }
 
+  let confidence =
+    Math.min(
+      96,
+      52 +
+      Math.abs(score) * 5
+    );
 
-  if (
-    last.close >
-    last.open
-  ) {
+  if (side !== "WAIT") {
 
-    score += 1;
-  }
+    confidence +=
+      confirmationForPair(
+        pair,
+        timeframe,
+        side
+      );
 
-
-  if (
-    last.close <
-    last.open
-  ) {
-
-    score -= 1;
-  }
-
-
-  let side =
-    "WAIT";
-
-
-  if (
-    score >= 5
-  ) {
-
-    side =
-      "CALL";
-  }
-
-
-  if (
-    score <= -5
-  ) {
-
-    side =
-      "PUT";
-  }
-
-
-  const confidence =
-    side === "WAIT"
-
-      ? Math.min(
-          69,
-          50 +
-          Math.abs(score) * 4
+    confidence =
+      Math.max(
+        0,
+        Math.min(
+          98,
+          confidence
         )
+      );
+  }
 
-      : Math.min(
-          95,
-          60 +
-          Math.abs(score) * 6
-        );
+  if (
+    side !== "WAIT" &&
+    confidence < MIN_CONFIDENCE
+  ) {
 
+    side = "WAIT";
+  }
+
+  if (side === "WAIT") {
+
+    confidence =
+      Math.min(
+        confidence,
+        MIN_CONFIDENCE - 1
+      );
+  }
 
   return {
 
@@ -735,7 +736,8 @@ function analyseSignal(
 
     side,
 
-    confidence,
+    confidence:
+      Math.round(confidence),
 
     score,
 
@@ -800,7 +802,6 @@ async function sendPush(
     return false;
   }
 
-
   try {
 
     const response =
@@ -842,16 +843,12 @@ async function sendPush(
         }
       );
 
-
     const result =
       await response
         .json()
         .catch(() => ({}));
 
-
-    if (
-      !response.ok
-    ) {
+    if (!response.ok) {
 
       console.log(
         "OneSignal error:",
@@ -861,12 +858,10 @@ async function sendPush(
       return false;
     }
 
-
     console.log(
       "Push sent:",
       title
     );
-
 
     return true;
 
@@ -883,7 +878,7 @@ async function sendPush(
 
 
 // =====================================================
-// OPEN TRADE
+// OPEN DEMO TRADE
 // =====================================================
 
 function canOpenTrade(
@@ -891,25 +886,28 @@ function canOpenTrade(
   timeframe
 ) {
 
+  if (
+    openTrades.size >=
+    MAX_OPEN_TRADES
+  ) {
+    return false;
+  }
+
   const id =
     tradeKey(
       pair,
       timeframe
     );
 
-
   if (
     openTrades.has(id)
   ) {
-
     return false;
   }
-
 
   const last =
     lastTradeTime.get(id)
     || 0;
-
 
   return (
     Date.now() -
@@ -918,18 +916,25 @@ function canOpenTrade(
   );
 }
 
-
 async function openTradeFromSignal(
   signal
 ) {
 
   if (
-    signal.side === "WAIT"
+    warmingUp ||
+    signal.side === "WAIT" ||
+    signal.confidence <
+      MIN_CONFIDENCE
   ) {
-
     return;
   }
 
+  const state =
+    ensureState(signal.pair);
+
+  if (!feedIsFresh(state)) {
+    return;
+  }
 
   if (
     !canOpenTrade(
@@ -937,21 +942,17 @@ async function openTradeFromSignal(
       signal.timeframe
     )
   ) {
-
     return;
   }
 
-
   const openedAtMs =
     Date.now();
-
 
   const id =
     tradeKey(
       signal.pair,
       signal.timeframe
     );
-
 
   const trade = {
 
@@ -982,6 +983,9 @@ async function openTradeFromSignal(
     result:
       "OPEN",
 
+    mode:
+      "DEMO",
+
     openedAt:
       new Date(
         openedAtMs
@@ -999,28 +1003,21 @@ async function openTradeFromSignal(
       null
   };
 
-
   openTrades.set(
     id,
     trade
   );
-
 
   lastTradeTime.set(
     id,
     openedAtMs
   );
 
-
   await sendPush(
 
-    `ADAMS OPTION — ${trade.pair} ${trade.direction}`,
+    `ADAMS OPTION — ${trade.direction} ${trade.pair}`,
 
-    `${trade.timeframe} | Entry ${trade.entry} | Expiry ${
-      trade.timeframe === "M5"
-        ? "5 min"
-        : "1 min"
-    } | Confidence ${trade.confidence}%`,
+    `${trade.timeframe} | ${trade.confidence}% | Entry ${trade.entry}`,
 
     {
       event:
@@ -1030,24 +1027,18 @@ async function openTradeFromSignal(
     }
   );
 
-
   console.log(
-
-    "NEW SIGNAL",
-
+    "NEW DEMO SIGNAL:",
     trade.pair,
-
     trade.timeframe,
-
     trade.direction,
-
     trade.confidence + "%"
   );
 }
 
 
 // =====================================================
-// WIN / LOST
+// SETTLE TRADES
 // =====================================================
 
 async function settleExpiredTrades(
@@ -1058,7 +1049,7 @@ async function settleExpiredTrades(
 
   for (
     const timeframe
-    of ["M1", "M5"]
+    of TIMEFRAMES
   ) {
 
     const id =
@@ -1067,30 +1058,24 @@ async function settleExpiredTrades(
         timeframe
       );
 
-
     const trade =
       openTrades.get(id);
-
 
     if (!trade) {
       continue;
     }
-
 
     const expiresAtMs =
       new Date(
         trade.expiresAt
       ).getTime();
 
-
     if (
       tickTimeMs <
       expiresAtMs
     ) {
-
       continue;
     }
-
 
     const exit =
       formatPrice(
@@ -1098,62 +1083,34 @@ async function settleExpiredTrades(
         currentPrice
       );
 
-
     let result =
       "DRAW";
 
-
     if (
-      trade.direction ===
-      "CALL"
+      trade.direction === "CALL"
     ) {
 
-      if (
-        exit >
-        trade.entry
-      ) {
-
-        result =
-          "WIN";
+      if (exit > trade.entry) {
+        result = "WIN";
       }
 
-
-      if (
-        exit <
-        trade.entry
-      ) {
-
-        result =
-          "LOST";
+      if (exit < trade.entry) {
+        result = "LOST";
       }
     }
 
-
     if (
-      trade.direction ===
-      "PUT"
+      trade.direction === "PUT"
     ) {
 
-      if (
-        exit <
-        trade.entry
-      ) {
-
-        result =
-          "WIN";
+      if (exit < trade.entry) {
+        result = "WIN";
       }
 
-
-      if (
-        exit >
-        trade.entry
-      ) {
-
-        result =
-          "LOST";
+      if (exit > trade.entry) {
+        result = "LOST";
       }
     }
-
 
     const closedTrade = {
 
@@ -1169,32 +1126,24 @@ async function settleExpiredTrades(
         ).toISOString()
     };
 
-
     openTrades.delete(id);
-
 
     addHistory(
       closedTrade
     );
 
-
     const icon =
       result === "WIN"
-
         ? "✅"
-
         : result === "LOST"
-
           ? "❌"
-
           : "➖";
-
 
     await sendPush(
 
-      `${trade.pair} ${trade.timeframe} — ${result} ${icon}`,
+      `${pair} ${timeframe} — ${result} ${icon}`,
 
-      `${trade.direction} | Entry ${trade.entry} | Exit ${exit}`,
+      `${trade.direction} | ${trade.entry} → ${exit}`,
 
       {
         event:
@@ -1205,21 +1154,13 @@ async function settleExpiredTrades(
       }
     );
 
-
     console.log(
-
-      "RESULT",
-
-      trade.pair,
-
-      trade.timeframe,
-
+      "RESULT:",
+      pair,
+      timeframe,
       result,
-
       trade.entry,
-
       "->",
-
       exit
     );
   }
@@ -1244,11 +1185,9 @@ function candleBucket(
   );
 }
 
-
 async function updateCandle(
   pair,
   timeframe,
-  intervalSec,
   priceValue,
   timestampSec
 ) {
@@ -1256,18 +1195,8 @@ async function updateCandle(
   const state =
     ensureState(pair);
 
-
-  const currentKey =
-    timeframe === "M1"
-      ? "currentM1"
-      : "currentM5";
-
-
-  const closedKey =
-    timeframe === "M1"
-      ? "closedM1"
-      : "closedM5";
-
+  const intervalSec =
+    TF_SECONDS[timeframe];
 
   const bucket =
     candleBucket(
@@ -1275,14 +1204,16 @@ async function updateCandle(
       intervalSec
     );
 
-
   let current =
-    state[currentKey];
-
+    state.current[
+      timeframe
+    ];
 
   if (!current) {
 
-    state[currentKey] = {
+    state.current[
+      timeframe
+    ] = {
 
       start:
         bucket,
@@ -1303,7 +1234,6 @@ async function updateCandle(
     return;
   }
 
-
   if (
     bucket ===
     current.start
@@ -1315,49 +1245,46 @@ async function updateCandle(
         priceValue
       );
 
-
     current.low =
       Math.min(
         current.low,
         priceValue
       );
 
-
     current.close =
       priceValue;
 
-
     return;
   }
-
 
   if (
     bucket <
     current.start
   ) {
-
     return;
   }
 
-
-  state[closedKey]
-    .push({
-      ...current
-    });
-
+  state.closed[
+    timeframe
+  ].push({
+    ...current
+  });
 
   if (
-    state[closedKey]
-      .length >
+    state.closed[
+      timeframe
+    ].length >
     MAX_CANDLES
   ) {
 
-    state[closedKey]
-      .shift();
+    state.closed[
+      timeframe
+    ].shift();
   }
 
-
-  state[currentKey] = {
+  state.current[
+    timeframe
+  ] = {
 
     start:
       bucket,
@@ -1375,7 +1302,6 @@ async function updateCandle(
       priceValue
   };
 
-
   const signal =
     analyseSignal(
 
@@ -1383,11 +1309,12 @@ async function updateCandle(
 
       timeframe,
 
-      state[closedKey],
+      state.closed[
+        timeframe
+      ],
 
       priceValue
     );
-
 
   signals.set(
 
@@ -1399,22 +1326,12 @@ async function updateCandle(
     signal
   );
 
-
   console.log(
-
     pair,
-
     timeframe,
-
     signal.side,
-
-    signal.confidence + "%",
-
-    "bars",
-
-    signal.bars
+    signal.confidence + "%"
   );
-
 
   await openTradeFromSignal(
     signal
@@ -1423,7 +1340,7 @@ async function updateCandle(
 
 
 // =====================================================
-// PRICE EVENT
+// LIVE PRICE EVENT
 // =====================================================
 
 async function handlePriceEvent(
@@ -1435,43 +1352,31 @@ async function handlePriceEvent(
       message.symbol || ""
     ).toUpperCase();
 
-
   if (
     !PAIRS.includes(pair)
   ) {
-
     return;
   }
-
 
   const priceValue =
     Number(
       message.price
     );
 
-
   const timestampSec =
     Number(
       message.timestamp
     );
 
-
   if (
-    !Number.isFinite(
-      priceValue
-    ) ||
-    !Number.isFinite(
-      timestampSec
-    )
+    !Number.isFinite(priceValue) ||
+    !Number.isFinite(timestampSec)
   ) {
-
     return;
   }
 
-
   const state =
     ensureState(pair);
-
 
   state.lastPrice =
     formatPrice(
@@ -1479,54 +1384,362 @@ async function handlePriceEvent(
       priceValue
     );
 
-
   state.lastTickAt =
     new Date(
       timestampSec *
       1000
     ).toISOString();
 
-
   wsLastEvent =
     nowIso();
 
-
   await settleExpiredTrades(
-
     pair,
-
     priceValue,
-
-    timestampSec *
-    1000
+    timestampSec * 1000
   );
 
-
   await updateCandle(
-
     pair,
-
     "M1",
-
-    60,
-
     priceValue,
-
     timestampSec
   );
 
+  await updateCandle(
+    pair,
+    "M5",
+    priceValue,
+    timestampSec
+  );
 
   await updateCandle(
-
     pair,
-
-    "M5",
-
-    300,
-
+    "M15",
     priceValue,
-
     timestampSec
+  );
+}
+
+
+// =====================================================
+// BUILD HIGHER TIMEFRAME FROM M1
+// =====================================================
+
+function aggregateCandles(
+  source,
+  intervalSec
+) {
+
+  const groups =
+    new Map();
+
+  for (
+    const candle
+    of source
+  ) {
+
+    const bucket =
+      candleBucket(
+        candle.start,
+        intervalSec
+      );
+
+    if (
+      !groups.has(bucket)
+    ) {
+
+      groups.set(
+        bucket,
+        {
+          start:
+            bucket,
+
+          open:
+            candle.open,
+
+          high:
+            candle.high,
+
+          low:
+            candle.low,
+
+          close:
+            candle.close
+        }
+      );
+
+    } else {
+
+      const item =
+        groups.get(bucket);
+
+      item.high =
+        Math.max(
+          item.high,
+          candle.high
+        );
+
+      item.low =
+        Math.min(
+          item.low,
+          candle.low
+        );
+
+      item.close =
+        candle.close;
+    }
+  }
+
+  return Array
+    .from(
+      groups.values()
+    )
+    .sort(
+      (a, b) =>
+        a.start - b.start
+    )
+    .slice(
+      -MAX_CANDLES
+    );
+}
+
+
+// =====================================================
+// STARTUP HISTORICAL WARMUP
+// Uses only 1-minute request per pair
+// M5/M15 are built locally
+// =====================================================
+
+async function warmPair(pair) {
+
+  if (!TWELVE_DATA_API_KEY) {
+    return;
+  }
+
+  try {
+
+    const url =
+      `${TD_TIME_SERIES}` +
+      `?symbol=${encodeURIComponent(pair)}` +
+      `&interval=1min` +
+      `&outputsize=${MAX_CANDLES}` +
+      `&apikey=${encodeURIComponent(
+        TWELVE_DATA_API_KEY
+      )}`;
+
+    console.log(
+      "Warming:",
+      pair
+    );
+
+    const response =
+      await fetch(url);
+
+    const data =
+      await response.json();
+
+    if (
+      !response.ok ||
+      !Array.isArray(data.values)
+    ) {
+
+      console.log(
+        "Warmup failed:",
+        pair,
+        data?.message ||
+        data?.status ||
+        "unknown"
+      );
+
+      return;
+    }
+
+    const m1 =
+      data.values
+        .map(row => ({
+
+          start:
+            Math.floor(
+              new Date(
+                row.datetime.replace(
+                  " ",
+                  "T"
+                ) + "Z"
+              ).getTime() /
+              1000
+            ),
+
+          open:
+            Number(row.open),
+
+          high:
+            Number(row.high),
+
+          low:
+            Number(row.low),
+
+          close:
+            Number(row.close)
+        }))
+        .filter(candle =>
+          Number.isFinite(
+            candle.start
+          ) &&
+          Number.isFinite(
+            candle.open
+          ) &&
+          Number.isFinite(
+            candle.high
+          ) &&
+          Number.isFinite(
+            candle.low
+          ) &&
+          Number.isFinite(
+            candle.close
+          )
+        )
+        .sort(
+          (a, b) =>
+            a.start - b.start
+        );
+
+    const state =
+      ensureState(pair);
+
+    state.closed.M1 =
+      m1.slice(
+        -MAX_CANDLES
+      );
+
+    state.closed.M5 =
+      aggregateCandles(
+        m1,
+        300
+      );
+
+    state.closed.M15 =
+      aggregateCandles(
+        m1,
+        900
+      );
+
+    if (m1.length) {
+
+      const last =
+        m1[
+          m1.length - 1
+        ];
+
+      state.lastPrice =
+        formatPrice(
+          pair,
+          last.close
+        );
+
+      for (
+        const timeframe
+        of TIMEFRAMES
+      ) {
+
+        const signal =
+          analyseSignal(
+
+            pair,
+
+            timeframe,
+
+            state.closed[
+              timeframe
+            ],
+
+            last.close
+          );
+
+        signals.set(
+
+          tradeKey(
+            pair,
+            timeframe
+          ),
+
+          signal
+        );
+      }
+    }
+
+    console.log(
+      "Warmup ready:",
+      pair,
+      "M1",
+      state.closed.M1.length,
+      "M5",
+      state.closed.M5.length,
+      "M15",
+      state.closed.M15.length
+    );
+
+  } catch (error) {
+
+    console.log(
+      "Warmup error:",
+      pair,
+      error.message
+    );
+  }
+}
+
+async function warmAllPairs() {
+
+  if (
+    !TWELVE_DATA_API_KEY
+  ) {
+    return;
+  }
+
+  warmingUp = true;
+
+  console.log(
+    "========================================"
+  );
+
+  console.log(
+    "STARTING HISTORICAL WARMUP"
+  );
+
+  console.log(
+    "8 pairs / 1 request each"
+  );
+
+  console.log(
+    "========================================"
+  );
+
+  for (
+    let i = 0;
+    i < PAIRS.length;
+    i++
+  ) {
+
+    await warmPair(
+      PAIRS[i]
+    );
+
+    if (
+      i <
+      PAIRS.length - 1
+    ) {
+
+      // Protect low API credit plans
+
+      await sleep(8500);
+    }
+  }
+
+  warmingUp = false;
+
+  console.log(
+    "HISTORICAL WARMUP COMPLETE"
   );
 }
 
@@ -1541,7 +1754,6 @@ async function handleWsMessage(
 
   let message;
 
-
   try {
 
     message =
@@ -1554,10 +1766,8 @@ async function handleWsMessage(
     return;
   }
 
-
   if (
-    message.event ===
-    "price"
+    message.event === "price"
   ) {
 
     await handlePriceEvent(
@@ -1566,7 +1776,6 @@ async function handleWsMessage(
 
     return;
   }
-
 
   if (
     message.event ===
@@ -1577,15 +1786,12 @@ async function handleWsMessage(
       Array.isArray(
         message.success
       )
-
         ? message.success
             .map(
               x => x.symbol
             )
             .filter(Boolean)
-
         : acceptedSymbols;
-
 
     const rejected =
       message.fails ||
@@ -1593,47 +1799,36 @@ async function handleWsMessage(
       message.errors ||
       [];
 
-
     rejectedSymbols =
       Array.isArray(
         rejected
       )
-
         ? rejected.map(
             x =>
               x.symbol ||
               x.message ||
               JSON.stringify(x)
           )
-
         : rejectedSymbols;
-
 
     console.log(
       "SUBSCRIBE STATUS:",
-      JSON.stringify(
-        message
-      )
+      JSON.stringify(message)
     );
 
     return;
   }
 
-
   if (
     message.event ===
     "heartbeat"
   ) {
-
     return;
   }
 
-
   console.log(
     "WS EVENT:",
-    JSON.stringify(
-      message
-    )
+    JSON.stringify(message)
   );
 }
 
@@ -1644,32 +1839,23 @@ async function handleWsMessage(
 
 function clearWsTimers() {
 
-  if (
-    heartbeatTimer
-  ) {
+  if (heartbeatTimer) {
 
     clearInterval(
       heartbeatTimer
     );
   }
 
-
-  if (
-    pingTimer
-  ) {
+  if (pingTimer) {
 
     clearInterval(
       pingTimer
     );
   }
 
+  heartbeatTimer = null;
 
-  heartbeatTimer =
-    null;
-
-
-  pingTimer =
-    null;
+  pingTimer = null;
 }
 
 
@@ -1683,13 +1869,10 @@ function scheduleReconnect() {
     shuttingDown ||
     reconnectTimer
   ) {
-
     return;
   }
 
-
   reconnectAttempt += 1;
-
 
   const waitMs =
     Math.min(
@@ -1704,18 +1887,13 @@ function scheduleReconnect() {
       )
     );
 
-
   console.log(
-
     "WebSocket reconnect in",
-
     Math.round(
       waitMs / 1000
     ),
-
     "seconds"
   );
-
 
   reconnectTimer =
     setTimeout(
@@ -1727,7 +1905,6 @@ function scheduleReconnect() {
         connectWebSocket();
 
       },
-
       waitMs
     );
 }
@@ -1739,9 +1916,7 @@ function scheduleReconnect() {
 
 function connectWebSocket() {
 
-  if (
-    !TWELVE_DATA_API_KEY
-  ) {
+  if (!TWELVE_DATA_API_KEY) {
 
     console.log(
       "TWELVE DATA KEY MISSING"
@@ -1750,63 +1925,47 @@ function connectWebSocket() {
     return;
   }
 
-
   if (
     ws &&
     (
       ws.readyState ===
         WebSocket.OPEN ||
-
       ws.readyState ===
         WebSocket.CONNECTING
     )
   ) {
-
     return;
   }
-
 
   const socketUrl =
     `${TD_WS_BASE}?apikey=${encodeURIComponent(
       TWELVE_DATA_API_KEY
     )}`;
 
-
   console.log(
     "Connecting Twelve Data WebSocket..."
   );
-
 
   ws =
     new WebSocket(
       socketUrl
     );
 
-
   ws.on(
     "open",
     () => {
 
-      wsConnected =
-        true;
+      wsConnected = true;
 
+      reconnectAttempt = 0;
 
-      reconnectAttempt =
-        0;
+      acceptedSymbols = [];
 
-
-      acceptedSymbols =
-        [];
-
-
-      rejectedSymbols =
-        [];
-
+      rejectedSymbols = [];
 
       console.log(
         "TWELVE DATA WEBSOCKET CONNECTED"
       );
-
 
       ws.send(
         JSON.stringify({
@@ -1822,9 +1981,7 @@ function connectWebSocket() {
         })
       );
 
-
       clearWsTimers();
-
 
       heartbeatTimer =
         setInterval(
@@ -1844,10 +2001,8 @@ function connectWebSocket() {
             }
 
           },
-
           HEARTBEAT_MS
         );
-
 
       pingTimer =
         setInterval(
@@ -1862,12 +2017,10 @@ function connectWebSocket() {
             }
 
           },
-
           PING_MS
         );
     }
   );
-
 
   ws.on(
     "message",
@@ -1887,7 +2040,6 @@ function connectWebSocket() {
     }
   );
 
-
   ws.on(
     "error",
     error => {
@@ -1899,7 +2051,6 @@ function connectWebSocket() {
     }
   );
 
-
   ws.on(
     "close",
     (
@@ -1907,23 +2058,16 @@ function connectWebSocket() {
       reason
     ) => {
 
-      wsConnected =
-        false;
-
+      wsConnected = false;
 
       clearWsTimers();
 
-
       console.log(
-
         "WEBSOCKET CLOSED:",
-
         code,
-
-        reason?.toString()
-        || ""
+        reason?.toString() ||
+        ""
       );
-
 
       scheduleReconnect();
     }
@@ -1940,19 +2084,15 @@ function getStats() {
   const completed =
     wins + losses;
 
-
   const winRate =
     completed > 0
-
       ? round(
           wins /
           completed *
           100,
           1
         )
-
       : 0;
-
 
   return {
 
@@ -1968,20 +2108,21 @@ function getStats() {
     winRate,
 
     openTrades:
-      openTrades.size
+      openTrades.size,
+
+    maxOpenTrades:
+      MAX_OPEN_TRADES
   };
 }
 
 
 // =====================================================
-// WEBSOCKET STATUS
+// WS STATUS
 // =====================================================
 
 function wsStatus() {
 
-  const pairStatus =
-    {};
-
+  const pairStatus = {};
 
   for (
     const pair
@@ -1991,7 +2132,6 @@ function wsStatus() {
     const state =
       ensureState(pair);
 
-
     pairStatus[pair] = {
 
       lastPrice:
@@ -2000,19 +2140,26 @@ function wsStatus() {
       lastTickAt:
         state.lastTickAt,
 
+      feedFresh:
+        feedIsFresh(state),
+
       m1Bars:
-        state.closedM1.length,
+        state.closed.M1.length,
 
       m5Bars:
-        state.closedM5.length
+        state.closed.M5.length,
+
+      m15Bars:
+        state.closed.M15.length
     };
   }
-
 
   return {
 
     connected:
       wsConnected,
+
+    warmingUp,
 
     acceptedSymbols,
 
@@ -2024,6 +2171,74 @@ function wsStatus() {
     pairs:
       pairStatus
   };
+}
+
+
+// =====================================================
+// GET BEST SIGNAL
+// =====================================================
+
+function getBestSignal(
+  timeframe = null
+) {
+
+  const all = [];
+
+  for (
+    const pair
+    of PAIRS
+  ) {
+
+    for (
+      const tf
+      of TIMEFRAMES
+    ) {
+
+      if (
+        timeframe &&
+        tf !== timeframe
+      ) {
+        continue;
+      }
+
+      const signal =
+        signals.get(
+          tradeKey(
+            pair,
+            tf
+          )
+        );
+
+      if (
+        !signal ||
+        signal.side === "WAIT"
+      ) {
+        continue;
+      }
+
+      const state =
+        ensureState(pair);
+
+      if (
+        !feedIsFresh(state)
+      ) {
+        continue;
+      }
+
+      all.push(signal);
+    }
+  }
+
+  all.sort(
+    (a, b) =>
+      b.confidence -
+      a.confidence
+  );
+
+  return (
+    all[0] ||
+    null
+  );
 }
 
 
@@ -2040,29 +2255,20 @@ app.get(
       app:
         "ADAMS OPTION SERVER",
 
-      mode:
-        "POCKET OPTION SIGNALS / MANUAL EXECUTION",
+      version:
+        "POCKET MODE 2.0",
 
-      feed:
-        "TWELVE DATA WEBSOCKET",
+      mode:
+        "DEMO SIGNALS / MANUAL POCKET OPTION EXECUTION",
 
       pairs:
         PAIRS,
 
-      timeframes: [
-        "M1",
-        "M5"
-      ],
+      timeframes:
+        TIMEFRAMES,
 
-      oneSignal:
-        (
-          ONESIGNAL_APP_ID &&
-          ONESIGNAL_REST_API_KEY
-        )
-
-          ? "ready"
-
-          : "missing env vars",
+      minConfidence:
+        MIN_CONFIDENCE,
 
       websocket:
         wsStatus(),
@@ -2091,6 +2297,8 @@ app.get(
 
       websocketConnected:
         wsConnected,
+
+      warmingUp,
 
       lastEvent:
         wsLastEvent,
@@ -2125,30 +2333,34 @@ app.get(
   "/api/signals",
   (req, res) => {
 
-    const result =
-      {};
-
+    const result = {};
 
     for (
       const pair
       of PAIRS
     ) {
 
-      result[pair] = {
+      result[pair] = {};
 
-        M1:
+      for (
+        const timeframe
+        of TIMEFRAMES
+      ) {
+
+        result[pair][
+          timeframe
+        ] =
           signals.get(
             tradeKey(
               pair,
-              "M1"
+              timeframe
             )
           )
           || {
 
             pair,
 
-            timeframe:
-              "M1",
+            timeframe,
 
             side:
               "WAIT",
@@ -2158,37 +2370,211 @@ app.get(
 
             reason:
               "WARMING_UP"
-          },
-
-
-        M5:
-          signals.get(
-            tradeKey(
-              pair,
-              "M5"
-            )
-          )
-          || {
-
-            pair,
-
-            timeframe:
-              "M5",
-
-            side:
-              "WAIT",
-
-            confidence:
-              0,
-
-            reason:
-              "WARMING_UP"
-          }
-      };
+          };
+      }
     }
 
-
     res.json(result);
+  }
+);
+
+
+// =====================================================
+// ANALYSE ONE PAIR
+// Example:
+// /api/analyse?pair=EUR/USD&timeframe=M1
+// =====================================================
+
+app.get(
+  "/api/analyse",
+  (req, res) => {
+
+    const pair =
+      String(
+        req.query.pair ||
+        "EUR/USD"
+      ).toUpperCase();
+
+    const timeframe =
+      String(
+        req.query.timeframe ||
+        "M1"
+      ).toUpperCase();
+
+    if (
+      !PAIRS.includes(pair)
+    ) {
+
+      return res.status(400)
+        .json({
+
+          error:
+            "Invalid pair"
+        });
+    }
+
+    if (
+      !TIMEFRAMES.includes(
+        timeframe
+      )
+    ) {
+
+      return res.status(400)
+        .json({
+
+          error:
+            "Invalid timeframe"
+        });
+    }
+
+    const state =
+      ensureState(pair);
+
+    const signal =
+      signals.get(
+        tradeKey(
+          pair,
+          timeframe
+        )
+      )
+      || {
+
+        pair,
+
+        timeframe,
+
+        side:
+          "WAIT",
+
+        confidence:
+          0,
+
+        reason:
+          "WARMING_UP"
+      };
+
+    res.json({
+
+      ...signal,
+
+      price:
+        state.lastPrice,
+
+      feedFresh:
+        feedIsFresh(state),
+
+      openTrade:
+        openTrades.get(
+          tradeKey(
+            pair,
+            timeframe
+          )
+        ) || null
+    });
+  }
+);
+
+
+// =====================================================
+// AUTO SCAN
+// Example:
+// /api/auto-scan?timeframe=M1
+// =====================================================
+
+app.get(
+  "/api/auto-scan",
+  (req, res) => {
+
+    const requested =
+      req.query.timeframe
+        ? String(
+            req.query.timeframe
+          ).toUpperCase()
+        : null;
+
+    if (
+      requested &&
+      !TIMEFRAMES.includes(
+        requested
+      )
+    ) {
+
+      return res.status(400)
+        .json({
+
+          error:
+            "Invalid timeframe"
+        });
+    }
+
+    const best =
+      getBestSignal(
+        requested
+      );
+
+    if (!best) {
+
+      return res.json({
+
+        side:
+          "WAIT",
+
+        confidence:
+          0,
+
+        reason:
+          "NO_CONFIRMED_SIGNAL",
+
+        timeframe:
+          requested ||
+          "ALL",
+
+        updatedAt:
+          nowIso()
+      });
+    }
+
+    res.json({
+
+      ...best,
+
+      autoScan:
+        true
+    });
+  }
+);
+
+
+// =====================================================
+// BEST SIGNAL
+// =====================================================
+
+app.get(
+  "/api/best-signal",
+  (req, res) => {
+
+    const best =
+      getBestSignal();
+
+    if (!best) {
+
+      return res.json({
+
+        side:
+          "WAIT",
+
+        confidence:
+          0,
+
+        reason:
+          "NO_CONFIRMED_SIGNAL",
+
+        updatedAt:
+          nowIso()
+      });
+    }
+
+    res.json(best);
   }
 );
 
@@ -2224,18 +2610,14 @@ app.get(
         100
       );
 
-
     const limit =
       Math.max(
-
         1,
-
         Math.min(
           MAX_HISTORY,
           requestedLimit
         )
       );
-
 
     res.json({
 
@@ -2253,7 +2635,7 @@ app.get(
 
 
 // =====================================================
-// WIN RATE
+// STATS
 // =====================================================
 
 app.get(
@@ -2281,9 +2663,8 @@ async function testNotification(
 
       "ADAMS OPTION ✅",
 
-      "OneSignal notifications are working."
+      "Notifications are working."
     );
-
 
   res.json({
 
@@ -2294,19 +2675,15 @@ async function testNotification(
         ONESIGNAL_APP_ID &&
         ONESIGNAL_REST_API_KEY
       )
-
         ? "configured"
-
         : "missing env vars"
   });
 }
-
 
 app.get(
   "/api/test-notification",
   testNotification
 );
-
 
 app.post(
   "/api/test-notification",
@@ -2320,25 +2697,35 @@ app.post(
 
 app.listen(
   PORT,
-  () => {
+  async () => {
 
     loadHistory();
-
 
     console.log(
       "========================================"
     );
 
-
     console.log(
-      `ADAMS OPTION SERVER running on port ${PORT}`
+      `ADAMS OPTION running on port ${PORT}`
     );
 
-
     console.log(
-      "MODE: POCKET OPTION SIGNALS / WEBSOCKET"
+      "MODE: POCKET OPTION DEMO / MANUAL"
     );
 
+    console.log(
+      "TIMEFRAMES: M1 M5 M15"
+    );
+
+    console.log(
+      "MIN CONFIDENCE:",
+      MIN_CONFIDENCE + "%"
+    );
+
+    console.log(
+      "MAX OPEN DEMO TRADES:",
+      MAX_OPEN_TRADES
+    );
 
     console.log(
       TWELVE_DATA_API_KEY
@@ -2346,30 +2733,33 @@ app.listen(
         : "TWELVE DATA KEY MISSING"
     );
 
-
     console.log(
       (
         ONESIGNAL_APP_ID &&
         ONESIGNAL_REST_API_KEY
       )
-
-        ? "ONESIGNAL env vars loaded"
-
-        : "ONESIGNAL env vars missing"
+        ? "ONESIGNAL loaded"
+        : "ONESIGNAL missing"
     );
-
-
-    console.log(
-      "NO TWELVE DATA REST POLLING"
-    );
-
 
     console.log(
       "========================================"
     );
 
-
     connectWebSocket();
+
+    warmAllPairs()
+      .catch(
+        error => {
+
+          warmingUp = false;
+
+          console.log(
+            "Warmup fatal error:",
+            error.message
+          );
+        }
+      );
   }
 );
 
@@ -2380,22 +2770,16 @@ app.listen(
 
 function shutdown() {
 
-  shuttingDown =
-    true;
-
+  shuttingDown = true;
 
   clearWsTimers();
 
-
-  if (
-    reconnectTimer
-  ) {
+  if (reconnectTimer) {
 
     clearTimeout(
       reconnectTimer
     );
   }
-
 
   try {
 
@@ -2411,7 +2795,6 @@ function shutdown() {
         })
       );
 
-
       ws.close(
         1000,
         "server shutdown"
@@ -2420,16 +2803,13 @@ function shutdown() {
 
   } catch {}
 
-
   process.exit(0);
 }
-
 
 process.on(
   "SIGTERM",
   shutdown
 );
-
 
 process.on(
   "SIGINT",
