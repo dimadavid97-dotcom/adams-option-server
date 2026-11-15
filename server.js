@@ -26,14 +26,34 @@ const ONESIGNAL_API_KEY =
 const MIN_CONFIDENCE =
   Number(process.env.MIN_CONFIDENCE || 72);
 
-const MAX_OPEN_TRADES =
-  Number(process.env.MAX_OPEN_TRADES || 2);
+const MAX_OPEN_TRADES = Math.min(8,Math.max(1,Number(process.env.MAX_OPEN_TRADES || 8)));
 
-const SCAN_SECONDS =
-  Math.max(
-    60,
-    Number(process.env.SCAN_SECONDS || 60)
-  );
+// Each cycle checks 3 out of 8 pairs. Each pair returns roughly every 15 min.
+const SCAN_SECONDS = 300;
+const FOREX_CALLS_PER_CYCLE = 3;
+const OPTION_DAILY_CREDIT_LIMIT = 435; // Leave 365 credits for BIT ADAMS and other requests.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const USAGE_FILE = "./api-usage.json";
+let creditsToday=0,creditsDate="",lastM5CycleAt=null,lastTelegramError=null,m5CycleBusy=false;
+function utcDay(){return new Date().toISOString().slice(0,10)}
+function loadUsage(){
+  try{const record=JSON.parse(fs.readFileSync(USAGE_FILE,"utf8"));if(record.date===utcDay()){creditsDate=record.date;creditsToday=Number(record.credits)||0;return;}}catch{}
+  creditsDate=utcDay();creditsToday=0;
+}
+function reserveCredit(){
+  if(creditsDate!==utcDay()){creditsDate=utcDay();creditsToday=0}
+  if(creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return false;
+  creditsToday++;
+  try{fs.writeFileSync(USAGE_FILE,JSON.stringify({date:creditsDate,credits:creditsToday}));}catch(e){console.warn("API usage persistence failed:",e.message)}
+  return true;
+}
+function forexWindowOpen(date=new Date()){
+  const day=new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"short"}).format(date);
+  const hour=Number(new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",hour:"2-digit",hourCycle:"h23"}).format(date));
+  return !["Sat","Sun"].includes(day)&&hour>=8&&hour<20;
+}
+loadUsage();
 
 const HISTORY_FILE = "./history.json";
 
@@ -252,6 +272,8 @@ async function refreshPair(
     );
   }
 
+  if(!forexWindowOpen())throw new Error("FOREX SCAN PAUSED OUTSIDE UK HOURS");
+  if(!reserveCredit())throw new Error("ADAMS OPTION DAILY API BUDGET REACHED");
   const url =
     new URL(
       "https://api.twelvedata.com/time_series"
@@ -264,12 +286,12 @@ async function refreshPair(
 
   url.searchParams.set(
     "interval",
-    "1min"
+    "5min"
   );
 
   url.searchParams.set(
     "outputsize",
-    "240"
+    "180"
   );
 
   url.searchParams.set(
@@ -350,11 +372,12 @@ async function refreshPair(
     }
   }
 
-  candles.sort(
-    (a, b) =>
-      a.time -
-      b.time
-  );
+  candles.sort((a,b)=>a.time-b.time);
+  // An unfinished market candle must never trigger an alert.
+  const nowSeconds=Math.floor(Date.now()/1000);
+  const closed=candles.filter(c=>c.time+300<=nowSeconds);
+  candles.length=0;
+  candles.push(...closed);
 
   if (
     candles.length === 0
@@ -972,11 +995,8 @@ function marketIsFresh(
     do not generate a signal.
   */
 
-  return (
-    now -
-      data.marketTime <
-    300
-  );
+  const closedAt=data.marketTime+300;
+  return closedAt<=now && now-closedAt<=360 && Date.now()-data.updatedAt<=180000;
 }
 
 /* =====================================================
@@ -1113,7 +1133,6 @@ async function analyse(
     timeframe === "M5"
   ) {
     confirmationTfs = [
-      "M1",
       "M15"
     ];
   } else {
@@ -1201,6 +1220,7 @@ async function analyse(
     conflicts.includes(
       "M15"
     ) ||
+    (timeframe==="M5" && !confirmations.includes("M15")) ||
     confidence <
       MIN_CONFIDENCE
   ) {
@@ -1431,6 +1451,22 @@ async function sendPush(
   }
 }
 
+
+/* Telegram is the only automatic notification channel for ADAMS OPTION.
+   Never log the bot token or expose it in API responses. */
+async function sendTelegram(message){
+  if(!TELEGRAM_BOT_TOKEN||!TELEGRAM_CHAT_ID){lastTelegramError="Telegram credentials not configured";return {ok:false,skipped:true}}
+  try{
+    const response=await fetch("https://api.telegram.org/bot"+TELEGRAM_BOT_TOKEN+"/sendMessage",{
+      method:"POST",signal:AbortSignal.timeout(8000),headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({chat_id:TELEGRAM_CHAT_ID,text:message,disable_web_page_preview:true})
+    });
+    const json=await response.json().catch(()=>({}));
+    if(!response.ok||!json.ok)throw new Error("Telegram delivery rejected (HTTP "+response.status+")");
+    lastTelegramError=null;return {ok:true};
+  }catch(error){lastTelegramError=error.message;console.error("ADAMS OPTION Telegram:",error.message);return {ok:false,error:error.message}}
+}
+
 /* =====================================================
    TRADE VALIDATION
 ===================================================== */
@@ -1582,17 +1618,15 @@ async function openTrade(
 
   saveHistory();
 
-  await sendPush(
-    `ADAMS OPTION • ${trade.direction}`,
-
-    `${trade.pair} • ${trade.timeframe} • ${trade.direction} • Score ${trade.confidence}% • Entry ${trade.entry} • Expiry ${signal.expiryMinutes}m`,
-
-    {
-      type:
-        "signal",
-
-      trade
-    }
+  await sendTelegram(
+    (trade.direction==="CALL"?"🟢":"🔴")+" ADAMS OPTION • "+trade.direction+
+    "\nPAIR: "+trade.pair+" (regular Forex, NOT OTC)"+
+    "\nTIMEFRAME: M5"+
+    "\nENTRY: "+trade.entry+
+    "\nEXPIRY: 5 minutes"+
+    "\nQUALITY SCORE: "+trade.confidence+"/100 (not win probability)"+
+    "\nMODE: SIGNAL + DEMO RESULT, no automatic Pocket Option trade"+
+    "\nID: "+trade.id
   );
 
   return trade;
@@ -1634,11 +1668,13 @@ async function settleTrade(
     return false;
   }
 
-  const exit =
-    roundPrice(
-      trade.pair,
-      market.price
-    );
+  // Use the first complete M5 candle that closed at or after expiry,
+  // rather than a later quote when this pair is scanned again.
+  const expirySeconds=Number(trade.expiresAt||trade.expiryAt)/1000;
+  const nowSeconds=Math.floor(Date.now()/1000);
+  const exitCandle=market.candles.find(c=>c.time+300>=expirySeconds&&c.time+300<=nowSeconds);
+  if(!exitCandle)return false;
+  const exit=roundPrice(trade.pair,exitCandle.close);
 
   let result =
     "DRAW";
@@ -1709,18 +1745,17 @@ async function settleTrade(
 
   saveHistory();
 
-  await sendPush(
-    `ADAMS OPTION • ${result}`,
-
-    `${finished.pair} • ${finished.timeframe} • ${finished.direction} • ${finished.entry} → ${finished.exit}`,
-
-    {
-      type:
-        "result",
-
-      trade:
-        finished
-    }
+  const stats=getStats();
+  await sendTelegram(
+    (result==="WIN"?"🏆":result==="LOST"?"⛔":"➖")+" ADAMS OPTION DEMO • "+result+
+    "\nPAIR: "+finished.pair+
+    "\nDIRECTION: "+finished.direction+
+    "\nTIMEFRAME: M5 • EXPIRY: 5m"+
+    "\nENTRY: "+finished.entry+" → EXIT: "+finished.exit+
+    "\nTOTAL WIN: "+stats.wins+" • LOST: "+stats.losses+" • DRAW: "+stats.draws+
+    "\nDEMO WIN RATE: "+stats.winRate+"%"+
+    "\nSOURCE: Twelve Data, NOT Pocket Option fill"+
+    "\nID: "+finished.id
   );
 
   return true;
@@ -1818,7 +1853,7 @@ function getStats() {
 ===================================================== */
 
 async function scanAll(
-  timeframe = "M1",
+  timeframe = "M5",
   openBest = true
 ) {
   const results = [];
@@ -2100,11 +2135,12 @@ function healthData() {
     totalPairs:
       PAIR_LIST.length,
 
-    pushConfigured:
-      Boolean(
-        ONESIGNAL_APP_ID &&
-        ONESIGNAL_API_KEY
-      )
+    pushConfigured:Boolean(ONESIGNAL_APP_ID&&ONESIGNAL_API_KEY),
+    telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN&&TELEGRAM_CHAT_ID),
+    telegramDeliveryError:lastTelegramError,
+    timeframe:"M5",autoScanEveryMinutes:5,forexOpen:forexWindowOpen(),
+    requestsToday:creditsToday,requestBudget:OPTION_DAILY_CREDIT_LIMIT,
+    lastM5CycleAt
   };
 }
 
@@ -2140,9 +2176,7 @@ async function analyseRoute(
       req.query?.pair;
 
     const timeframe =
-      req.body?.timeframe ||
-      req.query?.timeframe ||
-      "M1";
+      "M5";
 
     const signal =
       await analyse(
@@ -2224,11 +2258,7 @@ async function scanRoute(
 ) {
   try {
     const timeframe =
-      normalizeTf(
-        req.body?.timeframe ||
-        req.query?.timeframe ||
-        "M1"
-      );
+      "M5";
 
     const result =
       await scanAll(
@@ -2436,54 +2466,31 @@ app.post(
 );
 
 /* =====================================================
-   TIMERS
+   M5 BACKGROUND BOT • 3 API credits per 5 min, weekdays 08–20 UK
+   Eight regular Forex pairs rotate, three at a time; no OTC quotes.
 ===================================================== */
-
-/*
-  One REST request every 8 seconds.
-
-  8 pairs are therefore refreshed
-  in about 64 seconds.
-*/
-
-setInterval(
-  () => {
-    refreshNextPair()
-      .catch(
-        () => {}
-      );
-  },
-  8000
-);
-
-/*
-  Check expired demo trades.
-*/
-
-setInterval(
-  () => {
-    checkExpiredTrades()
-      .catch(
-        () => {}
-      );
-  },
-  2000
-);
-
-/*
-  Automatic signal scan.
-*/
-
-setInterval(
-  () => {
-    autoCycle()
-      .catch(
-        () => {}
-      );
-  },
-  SCAN_SECONDS *
-  1000
-);
+async function m5Cycle(){
+  if(!autoEnabled||m5CycleBusy||!forexWindowOpen()||creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return;
+  m5CycleBusy=true;
+  try{
+    for(let index=0;index<FOREX_CALLS_PER_CYCLE;index++){
+      const pair=PAIR_LIST[refreshIndex++ % PAIR_LIST.length];
+      try{
+        await refreshPair(pair);
+        // Also close previous demo trades using their actual expiry M5 candle.
+        await checkExpiredTrades();
+        const signal=await analyse(pair,"M5");
+        if(["CALL","PUT"].includes(signal.side)){
+          const trade=await openTrade(signal,"telegram-m5-auto");
+          if(trade)lastAuto=signal;
+        }
+      }catch(error){console.warn("M5 "+pair+":",error.message)}
+    }
+    lastM5CycleAt=new Date().toISOString();
+  }finally{m5CycleBusy=false}
+}
+setInterval(()=>{m5Cycle().catch(e=>console.error("M5 bot:",e.message))},SCAN_SECONDS*1000);
+setInterval(()=>{checkExpiredTrades().catch(()=>{})},30000);
 
 /* =====================================================
    START
@@ -2500,31 +2507,7 @@ app.listen(
       "REST market data mode"
     );
 
-    /*
-      Start first pair immediately.
-      Remaining pairs load gradually
-      to avoid API bursts.
-    */
-
-    await refreshNextPair();
-
-    /*
-      Auto scan after the server
-      has had time to load all pairs.
-    */
-
-    setTimeout(
-      () => {
-        if (
-          autoEnabled
-        ) {
-          autoCycle()
-            .catch(
-              () => {}
-            );
-        }
-      },
-      70000
-    );
+    // Start a capped scan only during weekday Forex hours.
+    if(forexWindowOpen())m5Cycle().catch(e=>console.error("Initial M5:",e.message));
   }
 );
