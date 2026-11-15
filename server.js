@@ -36,7 +36,6 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const USAGE_FILE = "./api-usage.json";
 let creditsToday=0,creditsDate="",lastM5CycleAt=null,lastTelegramError=null,m5CycleBusy=false;
-let telegramOneTimeTestStatus = null; // Temporary deployment test; remove after verification
 function utcDay(){return new Date().toISOString().slice(0,10)}
 function loadUsage(){
   try{const record=JSON.parse(fs.readFileSync(USAGE_FILE,"utf8"));if(record.date===utcDay()){creditsDate=record.date;creditsToday=Number(record.credits)||0;return;}}catch{}
@@ -2140,7 +2139,6 @@ function healthData() {
     pushConfigured:Boolean(ONESIGNAL_APP_ID&&ONESIGNAL_API_KEY),
     telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN&&TELEGRAM_CHAT_ID),
     telegramDeliveryError:lastTelegramError,
-    telegramOneTimeTestStatus,
     timeframe:"M5",autoScanEveryMinutes:5,forexOpen:forexWindowOpen(),
     requestsToday:creditsToday,requestBudget:OPTION_DAILY_CREDIT_LIMIT,
     lastM5CycleAt
@@ -2511,10 +2509,6 @@ app.listen(
     console.log(
       "REST market data mode"
     );
-
-    // Temporary one-time requested Telegram delivery test on this deployment.
-    const telegramOneTimeTestResult = await sendTelegram("✅ TEST ADAMS OPTION M5 — Telegram conectat. Acesta este doar un test; nu este semnal CALL/PUT.");
-    telegramOneTimeTestStatus = { at: new Date().toISOString(), delivered: Boolean(telegramOneTimeTestResult.ok) };
 
     // Start a capped scan only during weekday Forex hours.
     if(forexWindowOpen())m5Cycle().catch(e=>console.error("Initial M5:",e.message));
