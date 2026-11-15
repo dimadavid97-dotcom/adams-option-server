@@ -30,8 +30,8 @@ const MAX_OPEN_TRADES = Math.min(8,Math.max(1,Number(process.env.MAX_OPEN_TRADES
 
 // Each cycle checks 3 out of 8 pairs. Each pair returns roughly every 15 min.
 const SCAN_SECONDS = 300;
-const FOREX_CALLS_PER_CYCLE = 3;
-const OPTION_DAILY_CREDIT_LIMIT = 435; // Leave 365 credits for BIT ADAMS and other requests.
+const FOREX_CALLS_PER_CYCLE = 1;
+const OPTION_DAILY_CREDIT_LIMIT = 150; // 144 scheduled calls on UK weekdays, leaves room for BIT ADAMS (~576/day).
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const USAGE_FILE = "./api-usage.json";
@@ -304,11 +304,12 @@ async function refreshPair(
     TWELVE_DATA_API_KEY
   );
 
-  const response =
-    await fetch(url);
-
-  const json =
-    await response.json();
+  const response=await fetch(url,{signal:AbortSignal.timeout(10000)});
+  const json=await response.json();
+  if(json.status==="error" && /daily.*limit|credits for the day|daily quota/i.test(String(json.message||""))){
+    creditsToday=OPTION_DAILY_CREDIT_LIMIT;
+    try{fs.writeFileSync(USAGE_FILE,JSON.stringify({date:creditsDate,credits:creditsToday}));}catch{}
+  }
 
   if (
     !response.ok ||
@@ -2408,11 +2409,13 @@ app.post(
     autoEnabled =
       true;
 
-    autoCycle();
+    m5Cycle().catch(error=>console.error("Start M5:",error.message));
 
     res.json({
       ok: true,
-      running: true
+      running: true,
+      timeframe:"M5",
+      demoOnly:true
     });
   }
 );
@@ -2466,8 +2469,8 @@ app.post(
 );
 
 /* =====================================================
-   M5 BACKGROUND BOT • 3 API credits per 5 min, weekdays 08–20 UK
-   Eight regular Forex pairs rotate, three at a time; no OTC quotes.
+   M5 BACKGROUND BOT • 1 API credit per 5 min, weekdays 08–20 UK
+   Eight regular Forex pairs rotate, one at a time; no OTC quotes.
 ===================================================== */
 async function m5Cycle(){
   if(!autoEnabled||m5CycleBusy||!forexWindowOpen()||creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return;
