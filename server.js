@@ -1045,6 +1045,30 @@ function analyseTimeframe(
    MARKET FRESHNESS
 ===================================================== */
 
+// Independent M5 candle check: high scores alone must not trigger a demo CALL/PUT.
+function cleanM5EntryCheck(pair, base) {
+  const last=getCandles(pair,"M5").at(-1);
+  if(!last || !base || !Number.isFinite(base.atr) || base.atr<=0) {
+    return {approved:false,reason:"Missing completed M5 candle or volatility"};
+  }
+  const range=last.high-last.low;
+  if(!Number.isFinite(range) || range<=0) {
+    return {approved:false,reason:"Invalid M5 candle range"};
+  }
+  const bodyRatio=Math.abs(last.close-last.open)/range;
+  const closeLocation=(last.close-last.low)/range;
+  if(bodyRatio<0.38 || range>base.atr*1.7 || base.trendStrength<0.22) {
+    return {approved:false,reason:"Weak, overextended or sideways M5 candle"};
+  }
+  const call=base.direction==="CALL";
+  const aligned=call
+    ? last.close>last.open && closeLocation>=0.62 && base.momentum>0 &&
+      base.rsi>=50 && base.rsi<=70 && last.close>=base.ema5-base.atr*0.10
+    : last.close<last.open && closeLocation<=0.38 && base.momentum<0 &&
+      base.rsi>=30 && base.rsi<=50 && last.close<=base.ema5+base.atr*0.10;
+  return {approved:aligned,reason:aligned?"M5 candle and momentum agree":"M5 candle, momentum or RSI does not confirm direction"};
+}
+
 function marketIsFresh(
   pair
 ) {
@@ -1268,6 +1292,10 @@ async function analyse(
   let side =
     base.direction;
 
+  const m5Entry = timeframe==="M5"
+    ? cleanM5EntryCheck(pair,base)
+    : {approved:true,reason:""};
+
   const extremeRsi =
     (
       side === "CALL" &&
@@ -1286,6 +1314,7 @@ async function analyse(
   if (
     base.trendStrength <
       0.18 ||
+    (timeframe==="M5" && !m5Entry.approved) ||
     extremeRsi ||
     conflicts.includes(
       "M15"
@@ -1363,6 +1392,9 @@ async function analyse(
       side,
 
     confidence,
+    reason: side==="WAIT"
+      ? (!m5Entry.approved ? m5Entry.reason : "M5/M15 trend or quality score not confirmed")
+      : "Completed M5 candle, momentum and M15 trend confirmed",
 
     price,
     entry:
@@ -1544,7 +1576,7 @@ async function sendTelegram(message){
 function canOpenTrade(
   signal
 ) {
-  if (!storageReady) return false;
+  if (!storageReady || !forexWindowOpen()) return false;
 
   if (
     ![
@@ -1588,6 +1620,25 @@ function canOpenTrade(
   if (duplicate) {
     return false;
   }
+
+  // Use persisted history so a redeploy cannot reset entry/loss cooldowns.
+  const now=Date.now();
+  const samePair=trade=>trade.pair===signal.pair && trade.timeframe===signal.timeframe;
+  const cooldownMs=COOLDOWN[signal.timeframe] || 10*60*1000;
+  if(db.history.some(trade=>samePair(trade) &&
+      now-Number(trade.openedAt||trade.createdAt||0) < cooldownMs)) return false;
+  // Protect against revenge entries after a losing result.
+  if(db.history.some(trade=>samePair(trade) &&
+      ["LOST","LOSS"].includes(trade.result) &&
+      now-Number(trade.closedAt||0) < 20*60*1000)) return false;
+  const londonDay=time=>new Intl.DateTimeFormat("sv-SE",{
+    timeZone:"Europe/London",year:"numeric",month:"2-digit",day:"2-digit"
+  }).format(new Date(time));
+  const today=londonDay(now);
+  const stoppedToday=db.history.filter(trade=>samePair(trade) &&
+    ["LOST","LOSS"].includes(trade.result) &&
+    Number.isFinite(Number(trade.closedAt)) && londonDay(Number(trade.closedAt))===today).length;
+  if(stoppedToday>=2) return false;
 
   const key =
     `${signal.pair}|${signal.timeframe}|${signal.side}`;
