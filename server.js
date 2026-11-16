@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fs from "fs";
+import path from "path";
 
 dotenv.config();
 
@@ -34,7 +35,10 @@ const FOREX_CALLS_PER_CYCLE = 1;
 const OPTION_DAILY_CREDIT_LIMIT = 150; // 144 scheduled calls on UK weekdays, leaves room for BIT ADAMS (~576/day).
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const USAGE_FILE = "./api-usage.json";
+// Keep local snapshots on a configured Render persistent disk, if present.
+const DATA_DIR = process.env.PERSISTENCE_DIR || process.env.RENDER_DISK_MOUNT_PATH || ".";
+try { fs.mkdirSync(DATA_DIR,{recursive:true}); } catch (e) { console.warn("Data directory:",e.message); }
+const USAGE_FILE = path.join(DATA_DIR,"api-usage.json");
 let creditsToday=0,creditsDate="",lastM5CycleAt=null,lastTelegramError=null,m5CycleBusy=false;
 function utcDay(){return new Date().toISOString().slice(0,10)}
 function loadUsage(){
@@ -55,7 +59,12 @@ function forexWindowOpen(date=new Date()){
 }
 loadUsage();
 
-const HISTORY_FILE = "./history.json";
+const HISTORY_FILE = path.join(DATA_DIR,"history.json");
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const STORAGE_MODE = DATABASE_URL ? "postgres" :
+  (process.env.PERSISTENCE_DIR || process.env.RENDER_DISK_MOUNT_PATH) ? "persistent-disk" : "ephemeral";
+let storageReady = false, storageError = null, pgPool = null;
+let storageQueue = Promise.resolve();
 
 /* =====================================================
    PAIRS
@@ -156,25 +165,85 @@ function loadHistory() {
   }
 }
 
-let db =
-  loadHistory();
+let db = loadHistory();
+
+function normalizeDb(value) {
+  return {
+    openTrades: Array.isArray(value?.openTrades) ? value.openTrades : [],
+    history: Array.isArray(value?.history) ? value.history : []
+  };
+}
+
+// Postgres is durable across Render restarts. Without DATABASE_URL the server
+// retains the legacy local-file fallback; this fallback is NOT durable on Render
+// unless PERSISTENCE_DIR or RENDER_DISK_MOUNT_PATH points to a mounted disk.
+async function initStorage() {
+  if (!DATABASE_URL) {
+    db = normalizeDb(db);
+    storageReady = true;
+    if (STORAGE_MODE === "ephemeral")
+      console.warn("HISTORY WARNING: ephemeral storage. Configure DATABASE_URL for durable results.");
+    return;
+  }
+  try {
+    if (!pgPool) {
+      const { Pool } = await import("pg");
+      pgPool = new Pool({
+        connectionString: DATABASE_URL,
+        max: 2,
+        connectionTimeoutMillis: 10000,
+        idleTimeoutMillis: 30000
+      });
+      pgPool.on("error",error=>{
+        storageError=error.message;
+        console.error("Database connection:",error.message);
+      });
+    }
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS adams_option_state (
+      id INTEGER PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+    const saved = await pgPool.query("SELECT data FROM adams_option_state WHERE id = 1");
+    if (saved.rows.length) {
+      db = normalizeDb(saved.rows[0].data);
+    } else {
+      db = normalizeDb(db);
+      await pgPool.query(
+        "INSERT INTO adams_option_state (id,data) VALUES (1,$1::jsonb)",
+        [JSON.stringify(db)]
+      );
+    }
+    storageReady = true;
+    storageError = null;
+    console.log("ADAMS OPTION persistent Postgres history connected.");
+  } catch (error) {
+    storageReady = false;
+    storageError = error.message;
+    console.error("History database unavailable; blocking new demo signals:",error.message);
+  }
+}
 
 function saveHistory() {
-  try {
-    fs.writeFileSync(
-      HISTORY_FILE,
-      JSON.stringify(
-        db,
-        null,
-        2
-      )
-    );
-  } catch (e) {
-    console.log(
-      "History save error:",
-      e.message
-    );
-  }
+  const snapshot = JSON.stringify(db);
+  const write = async () => {
+    if (!storageReady) throw new Error("History storage unavailable");
+    if (DATABASE_URL) {
+      await pgPool.query(`INSERT INTO adams_option_state (id,data,updated_at)
+        VALUES (1,$1::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE
+        SET data=EXCLUDED.data,updated_at=NOW()`,[snapshot]);
+    }
+    try {
+      fs.writeFileSync(HISTORY_FILE,snapshot);
+    } catch (error) {
+      if (!DATABASE_URL) throw error;
+      console.warn("Local history snapshot failed:",error.message);
+    }
+  };
+  const pending = storageQueue.catch(()=>{}).then(write);
+  storageQueue = pending;
+  return pending;
 }
 
 /* =====================================================
@@ -1475,6 +1544,8 @@ async function sendTelegram(message){
 function canOpenTrade(
   signal
 ) {
+  if (!storageReady) return false;
+
   if (
     ![
       "CALL",
@@ -1608,16 +1679,17 @@ async function openTrade(
     origin
   };
 
-  db.openTrades.unshift(
-    trade
-  );
-
-  lastSignal.set(
-    `${signal.pair}|${signal.timeframe}|${signal.side}`,
-    now
-  );
-
-  saveHistory();
+  // Persist before notifying Telegram so alerts always have a recorded trade.
+  db.openTrades.unshift(trade);
+  const cooldownKey = `${signal.pair}|${signal.timeframe}|${signal.side}`;
+  try {
+    await saveHistory();
+  } catch (error) {
+    db.openTrades = db.openTrades.filter(item=>item.id!==trade.id);
+    console.error("Refusing unrecorded demo signal:",error.message);
+    return null;
+  }
+  lastSignal.set(cooldownKey,now);
 
   await sendTelegram(
     (trade.direction==="CALL"?"🟢":"🔴")+" ADAMS OPTION • "+trade.direction+
@@ -1744,7 +1816,15 @@ async function settleTrade(
       1000
     );
 
-  saveHistory();
+  try {
+    await saveHistory();
+  } catch (error) {
+    // Keep the expired trade pending if its result cannot be stored safely.
+    db.openTrades.unshift(trade);
+    db.history = db.history.filter(item=>item.id!==trade.id);
+    console.error("Settlement persistence failed:",error.message);
+    return false;
+  }
 
   const stats=getStats();
   await sendTelegram(
@@ -1766,29 +1846,16 @@ async function settleTrade(
    CHECK EXPIRY
 ===================================================== */
 
+const settlingTrades = new Set();
 async function checkExpiredTrades() {
-  const now =
-    Date.now();
-
-  for (
-    const trade of
-    [...db.openTrades]
-  ) {
-    const expiry =
-      Number(
-        trade.expiresAt ||
-        trade.expiryAt ||
-        0
-      );
-
-    if (
-      expiry &&
-      expiry <= now
-    ) {
-      await settleTrade(
-        trade
-      );
-    }
+  const now = Date.now();
+  for (const trade of [...db.openTrades]) {
+    const expiry = Number(trade.expiresAt || trade.expiryAt || 0);
+    if (!expiry || expiry > now || settlingTrades.has(trade.id)) continue;
+    settlingTrades.add(trade.id);
+    try { await settleTrade(trade); }
+    catch (error) { console.error("Demo settlement:",error.message); }
+    finally { settlingTrades.delete(trade.id); }
   }
 }
 
@@ -2141,6 +2208,9 @@ function healthData() {
     telegramDeliveryError:lastTelegramError,
     timeframe:"M5",autoScanEveryMinutes:5,forexOpen:forexWindowOpen(),
     requestsToday:creditsToday,requestBudget:OPTION_DAILY_CREDIT_LIMIT,
+    historyStorage: {mode:STORAGE_MODE,ready:storageReady,
+      durable:STORAGE_MODE!=="ephemeral"&&storageReady,error:storageError},
+    pendingSettlements:db.openTrades.filter(t=>Number(t.expiresAt||t.expiryAt||0)<=Date.now()).length,
     lastM5CycleAt
   };
 }
@@ -2473,11 +2543,15 @@ app.post(
    Eight regular Forex pairs rotate, one at a time; no OTC quotes.
 ===================================================== */
 async function m5Cycle(){
-  if(!autoEnabled||m5CycleBusy||!forexWindowOpen()||creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return;
+  if(!autoEnabled||!storageReady||m5CycleBusy||!forexWindowOpen()||creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return;
   m5CycleBusy=true;
   try{
     for(let index=0;index<FOREX_CALLS_PER_CYCLE;index++){
-      const pair=PAIR_LIST[refreshIndex++ % PAIR_LIST.length];
+      // Prioritize due results so an expiring M5 trade is not left waiting
+      // through an entire eight-pair rotation. One data call per cycle stays.
+      const due=db.openTrades.filter(t=>Number(t.expiresAt||t.expiryAt||0)<=Date.now())
+        .sort((a,b)=>Number(a.expiresAt||a.expiryAt)-Number(b.expiresAt||b.expiryAt))[0];
+      const pair=due?.pair || PAIR_LIST[refreshIndex++ % PAIR_LIST.length];
       try{
         await refreshPair(pair);
         // Also close previous demo trades using their actual expiry M5 candle.
@@ -2499,18 +2573,16 @@ setInterval(()=>{checkExpiredTrades().catch(()=>{})},30000);
    START
 ===================================================== */
 
-app.listen(
-  PORT,
-  async () => {
-    console.log(
-      `ADAMS OPTION running on port ${PORT}`
-    );
-
-    console.log(
-      "REST market data mode"
-    );
-
-    // Start a capped scan only during weekday Forex hours.
-    if(forexWindowOpen())m5Cycle().catch(e=>console.error("Initial M5:",e.message));
-  }
-);
+async function startServer() {
+  await initStorage();
+  app.listen(PORT, () => {
+    console.log(`ADAMS OPTION running on port ${PORT} (history: ${STORAGE_MODE})`);
+    console.log("REST market data mode");
+    if (forexWindowOpen()) m5Cycle().catch(e=>console.error("Initial M5:",e.message));
+  });
+  // Recover from a temporary database outage without needing a redeploy.
+  if (DATABASE_URL) setInterval(()=>{
+    if (!storageReady) initStorage().catch(e=>console.error("Storage retry:",e.message));
+  },60000);
+}
+startServer().catch(error=>{ console.error("Startup:",error.message); process.exitCode=1; });
