@@ -1069,6 +1069,50 @@ function cleanM5EntryCheck(pair, base) {
   return {approved:aligned,reason:aligned?"M5 candle and momentum agree":"M5 candle, momentum or RSI does not confirm direction"};
 }
 
+// Four deterministic M5 reviewers use one shared market-data feed (no extra API calls).
+function reviewOptionAgents(pair,base,confirmations){
+  const candles=getCandles(pair,"M5");
+  const last=candles.at(-1),prev=candles.at(-2);
+  const m15=analyseTimeframe(pair,"M15");
+  const side=base?.direction,sign=side==="CALL"?1:side==="PUT"?-1:0;
+  if(!sign||!last||!prev||!m15||![last.open,last.close,last.high,last.low,prev.high,prev.low,
+      base.atr,base.ema5,base.ema13,base.rsi,base.momentum].every(Number.isFinite)){
+    return {approved:false,votes:0,totalAgents:4,reason:"Incomplete M5/M15 data",
+      trend:{approved:false},entry:{approved:false},momentum:{approved:false},risk:{approved:false}};
+  }
+  const range=last.high-last.low,body=sign*(last.close-last.open);
+  const bodyRatio=range>0?body/range:0;
+  const location=range>0?(last.close-last.low)/range:0.5;
+  const rsiOk=side==="CALL"?base.rsi>=50&&base.rsi<=70:base.rsi>=30&&base.rsi<=50;
+  const emaAligned=sign*(base.ema5-base.ema13)>0;
+  const trendOk=confirmations.includes("M15")&&m15.direction===side&&
+    sign*(m15.ema5-m15.ema13)>0&&base.trendStrength>=0.18;
+  const trend={approved:trendOk,reason:trendOk?"M5/M15 trend agrees":"M15 trend not confirmed"};
+  const classic=cleanM5EntryCheck(pair,base);
+  const breakout=side==="CALL"?last.close>prev.high:last.close<prev.low;
+  const nearEma=base.atr>0&&Math.abs(last.close-base.ema5)<=base.atr*1.25;
+  const continuation=breakout&&nearEma&&bodyRatio>=0.42&&range>0&&
+    range<=base.atr*1.6&&emaAligned;
+  const entry={approved:classic.approved||continuation,
+    type:classic.approved?"M5 CANDLE":continuation?"M5 BREAKOUT":"WAIT",
+    reason:classic.approved?"Strong closed M5 candle":continuation?"Controlled M5 breakout":classic.reason};
+  const momentumOk=sign*base.momentum>0&&emaAligned&&rsiOk&&body>0;
+  const momentum={approved:momentumOk,
+    reason:momentumOk?"EMA RSI momentum agree":"Momentum not confirmed"};
+  // Mandatory risk veto: closed directional M5 candle, reasonable range,
+  // non-extreme RSI, and entry price not overly far from EMA5.
+  const riskOk=marketIsFresh(pair)&&base.atr>0&&range>0&&bodyRatio>=0.34&&
+    range<=base.atr*1.7&&nearEma&&rsiOk&&
+    (side==="CALL"?location>=0.56:location<=0.44);
+  const risk={approved:riskOk,reason:riskOk?"Risk conditions passed":"Unsafe or overextended entry"};
+  const votes=[trend,entry,momentum,risk].filter(a=>a.approved).length;
+  const approved=trend.approved&&risk.approved&&votes>=3&&(entry.approved||momentum.approved);
+  return {approved,votes,totalAgents:4,trend,entry,momentum,risk,
+    reason:approved?"M5 "+votes+"/4 reviewers approved":!trend.approved?
+      "Trend Agent: "+trend.reason:!risk.approved?
+      "Risk Agent: "+risk.reason:"Entry/Momentum reviewers do not agree"};
+}
+
 function marketIsFresh(
   pair
 ) {
@@ -1292,8 +1336,9 @@ async function analyse(
   let side =
     base.direction;
 
+  const agentReview=timeframe==="M5"?reviewOptionAgents(pair,base,confirmations):null;
   const m5Entry = timeframe==="M5"
-    ? cleanM5EntryCheck(pair,base)
+    ? {approved:agentReview.approved,reason:agentReview.reason}
     : {approved:true,reason:""};
 
   const extremeRsi =
@@ -1394,7 +1439,8 @@ async function analyse(
     confidence,
     reason: side==="WAIT"
       ? (!m5Entry.approved ? m5Entry.reason : "M5/M15 trend or quality score not confirmed")
-      : "Completed M5 candle, momentum and M15 trend confirmed",
+      : "Completed M5 candle/M15 trend, "+(agentReview?.votes??0)+"/4 agents approved",
+    agentReview,
 
     price,
     entry:
@@ -1749,6 +1795,7 @@ async function openTrade(
     "\nENTRY: "+trade.entry+
     "\nEXPIRY: 5 minutes"+
     "\nQUALITY SCORE: "+trade.confidence+"/100 (not win probability)"+
+    "\nAGENTS: "+(signal.agentReview?.votes??"-")+"/4 approved"+
     "\nMODE: SIGNAL + DEMO RESULT, no automatic Pocket Option trade"+
     "\nID: "+trade.id
   );
@@ -2594,29 +2641,34 @@ app.post(
    Eight regular Forex pairs rotate, one at a time; no OTC quotes.
 ===================================================== */
 async function m5Cycle(){
-  if(!autoEnabled||!storageReady||m5CycleBusy||!forexWindowOpen()||creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return;
+  // Continue verifying OPEN demo expiries after the new-signal window closes.
+  if(!storageReady||m5CycleBusy||creditsToday>=OPTION_DAILY_CREDIT_LIMIT)return;
+  const now=Date.now();
+  const due=db.openTrades.filter(t=>Number(t.expiresAt||t.expiryAt||0)<=now)
+    .sort((a,b)=>Number(a.expiresAt||a.expiryAt)-Number(b.expiresAt||b.expiryAt))[0];
+  const allowNewSignal=autoEnabled&&forexWindowOpen();
+  if(!allowNewSignal&&!due)return;
   m5CycleBusy=true;
   try{
     for(let index=0;index<FOREX_CALLS_PER_CYCLE;index++){
-      // Prioritize due results so an expiring M5 trade is not left waiting
-      // through an entire eight-pair rotation. One data call per cycle stays.
-      const due=db.openTrades.filter(t=>Number(t.expiresAt||t.expiryAt||0)<=Date.now())
-        .sort((a,b)=>Number(a.expiresAt||a.expiryAt)-Number(b.expiresAt||b.expiryAt))[0];
       const pair=due?.pair || PAIR_LIST[refreshIndex++ % PAIR_LIST.length];
       try{
         await refreshPair(pair);
-        // Also close previous demo trades using their actual expiry M5 candle.
         await checkExpiredTrades();
-        const signal=await analyse(pair,"M5");
-        if(["CALL","PUT"].includes(signal.side)){
-          const trade=await openTrade(signal,"telegram-m5-auto");
-          if(trade)lastAuto=signal;
+        if(allowNewSignal){
+          const signal=await analyse(pair,"M5");
+          if(["CALL","PUT"].includes(signal.side)){
+            const trade=await openTrade(signal,"telegram-m5-auto");
+            if(trade)lastAuto=signal;
+          }
         }
       }catch(error){console.warn("M5 "+pair+":",error.message)}
+      if(due)break; // reserve credits for settlement, never open after-hours
     }
     lastM5CycleAt=new Date().toISOString();
   }finally{m5CycleBusy=false}
 }
+
 setInterval(()=>{m5Cycle().catch(e=>console.error("M5 bot:",e.message))},SCAN_SECONDS*1000);
 setInterval(()=>{checkExpiredTrades().catch(()=>{})},30000);
 
@@ -2629,7 +2681,8 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log(`ADAMS OPTION running on port ${PORT} (history: ${STORAGE_MODE})`);
     console.log("REST market data mode");
-    if (forexWindowOpen()) m5Cycle().catch(e=>console.error("Initial M5:",e.message));
+    if (forexWindowOpen() || db.openTrades.some(t=>Number(t.expiresAt||t.expiryAt||0)<=Date.now()))
+      m5Cycle().catch(e=>console.error("Initial M5:",e.message));
   });
   // Recover from a temporary database outage without needing a redeploy.
   if (DATABASE_URL) setInterval(()=>{
