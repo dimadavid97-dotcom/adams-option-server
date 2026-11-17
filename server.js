@@ -1829,18 +1829,13 @@ async function settleTrade(
     return false;
   }
 
-  /*
-    Don't settle using stale
-    market prices.
-  */
-
-  if (
-    !marketIsFresh(
-      trade.pair
-    )
-  ) {
-    return false;
-  }
+  // A settled DEMO result uses the historical closed M5 candle AT expiry.
+  // It does not require the market's latest candle to still be live (for
+  // example after 20:00 UK or during a restart). Require a recent successful
+  // provider refresh, and refuse to invent an exit when the expiry candle
+  // cannot be found in that response.
+  if (!Number.isFinite(market.updatedAt) ||
+      Date.now()-market.updatedAt>180000) return false;
 
   // Use the first complete M5 candle that closed at or after expiry,
   // rather than a later quote when this pair is scanned again.
