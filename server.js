@@ -331,7 +331,8 @@ function sleep(ms) {
 ===================================================== */
 
 async function refreshPair(
-  pair
+  pair,
+  forSettlement = false
 ) {
   if (
     !TWELVE_DATA_API_KEY
@@ -341,7 +342,9 @@ async function refreshPair(
     );
   }
 
-  if(!forexWindowOpen())throw new Error("FOREX SCAN PAUSED OUTSIDE UK HOURS");
+  // After the entry window closes, still fetch the due pair's exact M5
+  // expiry candle to settle already-open demo trades.
+  if(!forexWindowOpen()&&!forSettlement)throw new Error("FOREX SCAN PAUSED OUTSIDE UK HOURS");
   if(!reserveCredit())throw new Error("ADAMS OPTION DAILY API BUDGET REACHED");
   const url =
     new URL(
@@ -2288,6 +2291,10 @@ function healthData() {
     status:
       "online",
 
+    version:"OPTION M5 4-AGENTS + EXPIRY RECOVERY",
+    agents:4,
+    settlementRecovery:true,
+
     server:
       "online",
 
@@ -2653,7 +2660,7 @@ async function m5Cycle(){
     for(let index=0;index<FOREX_CALLS_PER_CYCLE;index++){
       const pair=due?.pair || PAIR_LIST[refreshIndex++ % PAIR_LIST.length];
       try{
-        await refreshPair(pair);
+        await refreshPair(pair,Boolean(due));
         await checkExpiredTrades();
         if(allowNewSignal){
           const signal=await analyse(pair,"M5");
