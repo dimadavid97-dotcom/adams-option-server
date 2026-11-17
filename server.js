@@ -32,7 +32,7 @@ const MAX_OPEN_TRADES = Math.min(8,Math.max(1,Number(process.env.MAX_OPEN_TRADES
 // Each cycle checks 3 out of 8 pairs. Each pair returns roughly every 15 min.
 const SCAN_SECONDS = 300;
 const FOREX_CALLS_PER_CYCLE = 1;
-const OPTION_DAILY_CREDIT_LIMIT = 150; // 144 scheduled calls on UK weekdays, leaves room for BIT ADAMS (~576/day).
+const OPTION_DAILY_CREDIT_LIMIT = 175; // 168 scheduled M5 calls during UK weekdays 08–22; combined app caps 500 + 175 = 675.
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 // Keep local snapshots on a configured Render persistent disk, if present.
@@ -55,7 +55,7 @@ function reserveCredit(){
 function forexWindowOpen(date=new Date()){
   const day=new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",weekday:"short"}).format(date);
   const hour=Number(new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/London",hour:"2-digit",hourCycle:"h23"}).format(date));
-  return !["Sat","Sun"].includes(day)&&hour>=8&&hour<20;
+  return !["Sat","Sun"].includes(day)&&hour>=8&&hour<22;
 }
 loadUsage();
 
@@ -1831,7 +1831,7 @@ async function settleTrade(
 
   // A settled DEMO result uses the historical closed M5 candle AT expiry.
   // It does not require the market's latest candle to still be live (for
-  // example after 20:00 UK or during a restart). Require a recent successful
+  // example after 22:00 UK or during a restart). Require a recent successful
   // provider refresh, and refuse to invent an exit when the expiry candle
   // cannot be found in that response.
   if (!Number.isFinite(market.updatedAt) ||
@@ -2306,7 +2306,7 @@ function healthData() {
     pushConfigured:Boolean(ONESIGNAL_APP_ID&&ONESIGNAL_API_KEY),
     telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN&&TELEGRAM_CHAT_ID),
     telegramDeliveryError:lastTelegramError,
-    timeframe:"M5",autoScanEveryMinutes:5,forexOpen:forexWindowOpen(),
+    timeframe:"M5",autoScanEveryMinutes:5,forexOpen:forexWindowOpen(),signalHoursUk:"08:00–22:00",
     requestsToday:creditsToday,requestBudget:OPTION_DAILY_CREDIT_LIMIT,
     historyStorage: {mode:STORAGE_MODE,ready:storageReady,
       durable:STORAGE_MODE!=="ephemeral"&&storageReady,error:storageError},
@@ -2639,7 +2639,7 @@ app.post(
 );
 
 /* =====================================================
-   M5 BACKGROUND BOT • 1 API credit per 5 min, weekdays 08–20 UK
+   M5 BACKGROUND BOT • 1 API credit per 5 min, weekdays 08–22 UK
    Eight regular Forex pairs rotate, one at a time; no OTC quotes.
 ===================================================== */
 async function m5Cycle(){
