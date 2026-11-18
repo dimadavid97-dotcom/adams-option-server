@@ -1116,6 +1116,32 @@ function reviewOptionAgents(pair,base,confirmations){
       "Risk Agent: "+risk.reason:"Entry/Momentum reviewers do not agree"};
 }
 
+// ADAMS COMMANDER: fifth reviewer using existing market data, no extra API calls.
+// Setup quality is not a win probability. Entry, Trend and Risk have mandatory veto.
+function chiefOptionAgent(pair,base,signalScore,review) {
+  const side=base?.direction,sign=side==="CALL"?1:side==="PUT"?-1:0;
+  const candles=getCandles(pair,"M5");
+  const last=candles.at(-1);
+  const m15=analyseTimeframe(pair,"M15");
+  const checks=[
+    [Boolean(sign && last && m15),"Incomplete M5/M15 data"],
+    [marketIsFresh(pair),"Market data stale or M5 candle incomplete"],
+    [review?.approved===true && review?.votes>=3,"Four-agent panel rejected setup"],
+    [review?.trend?.approved===true && review?.risk?.approved===true,
+      "Trend or Risk agent veto"],
+    [review?.entry?.approved===true,"Entry agent rejected closed M5 candle"],
+    [m15?.direction===side,"M15 direction disagreement"],
+    [Number.isFinite(signalScore) && signalScore>=Math.max(72,MIN_CONFIDENCE),
+      "Quality score below Chief threshold"],
+    [Boolean(last && sign*(last.close-last.open)>0),
+      "M5 candle does not confirm signal direction"]
+  ];
+  const failed=checks.find(([pass])=>!pass);
+  return {approved:!failed,decision:failed?"HOLD":"GREEN_LIGHT",
+    reason:failed?failed[1]:"Chief green light: Trend + Entry + Risk confirmed",
+    entryMandatory:true,votes:Number(review?.votes)||0};
+}
+
 function marketIsFresh(
   pair
 ) {
@@ -1340,8 +1366,9 @@ async function analyse(
     base.direction;
 
   const agentReview=timeframe==="M5"?reviewOptionAgents(pair,base,confirmations):null;
+  const chiefReview=timeframe==="M5" ? chiefOptionAgent(pair,base,confidence,agentReview) : null;
   const m5Entry = timeframe==="M5"
-    ? {approved:agentReview.approved,reason:agentReview.reason}
+    ? {approved:chiefReview.approved,reason:"Chief Agent: "+chiefReview.reason}
     : {approved:true,reason:""};
 
   const extremeRsi =
@@ -1444,6 +1471,7 @@ async function analyse(
       ? (!m5Entry.approved ? m5Entry.reason : "M5/M15 trend or quality score not confirmed")
       : "Completed M5 candle/M15 trend, "+(agentReview?.votes??0)+"/4 agents approved",
     agentReview,
+    chiefReview,
 
     price,
     entry:
@@ -1626,6 +1654,7 @@ function canOpenTrade(
   signal
 ) {
   if (!storageReady || !forexWindowOpen()) return false;
+  if(signal?.timeframe==="M5" && signal?.chiefReview?.approved!==true) return false;
 
   if (
     ![
@@ -1799,6 +1828,7 @@ async function openTrade(
     "\nEXPIRY: 5 minutes"+
     "\nQUALITY SCORE: "+trade.confidence+"/100 (not win probability)"+
     "\nAGENTS: "+(signal.agentReview?.votes??"-")+"/4 approved"+
+    "\nCHIEF: "+(signal.chiefReview?.approved?"UNDĂ VERDE":"HOLD")+
     "\nMODE: SIGNAL + DEMO RESULT, no automatic Pocket Option trade"+
     "\nID: "+trade.id
   );
